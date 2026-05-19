@@ -27,6 +27,10 @@ export interface DownloadOptions {
   pagesWithChildren: Set<string>;
   // Pre-built map: `${spaceKey}::${title}` → page id. Used to resolve ac:link[ri:page] hits.
   titleIndex: Map<string, string>;
+  // Called after each successful page write so state is persisted incrementally.
+  // If the process is interrupted mid-sync, the next run resumes from the last
+  // flushed state instead of re-downloading the whole batch.
+  flushState?: () => Promise<void>;
 }
 
 export interface DownloadResult {
@@ -206,6 +210,17 @@ export async function downloadPages(pages: ConfluencePage[], opts: DownloadOptio
           opts.state.pages[detailed.id] = st;
           opts.knownPagePaths.set(detailed.id, result.relPath);
           opts.titleIndex.set(titleIndexKey(detailedSpace, detailed.title), detailed.id);
+          // Persist after every successful page so an interrupt is recoverable.
+          // writeState is atomic (.tmp + rename); concurrent calls just clobber
+          // each other's renames, which is fine — they all write the same in-memory
+          // state object's current snapshot.
+          if (opts.flushState) {
+            try {
+              await opts.flushState();
+            } catch (err) {
+              log.warn({ err, id: detailed.id }, 'failed to flush state mid-sync (will retry on next page)');
+            }
+          }
         } catch (err) {
           log.error({ err, id: page.id }, 'page fetch failed');
           errors.push({ id: page.id, error: err });

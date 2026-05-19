@@ -30,16 +30,15 @@ That's the daily-driver. With no args it runs an **incremental sync** — the fi
 
 The very first run also benchmarks download concurrency on a sample of pages and writes the chosen value into `config.yaml` under `sync.parallel_downloads`, so future runs reuse it. Comment out (or delete) that line to force a re-bench; edit it by hand to pin a specific value.
 
-There's an opt-in `poll` mode (`npm start -- poll`) that loops sync forever, but it's not the default — doc-watcher is read-only for now, so there's no urgency to be live.
+**Resumable**: state is flushed after every successful page write. If you Ctrl+C mid-sync (or anything else interrupts the process), just run `npm start` again — already-downloaded pages are skipped via their stored version number, and the sync picks up where it left off.
 
 ## One-shot verbs
 
-For manual operations instead of leaving the default sync flow:
+For manual operations instead of the default sync flow:
 
-- `npm start -- sync` — one incremental sync, then exit.
+- `npm start -- sync` — one incremental sync, then exit (same as the default).
 - `npm start -- refresh` — full re-download (ignores `last_sync`, reconciles deletes).
 - `npm start -- reconvert` — regenerate every `.md` from the saved `.html`. No network.
-- `npm start -- poll` — loop sync forever at the cadence set in `config.yaml`.
 
 ## Output layout
 

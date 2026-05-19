@@ -27,11 +27,6 @@ sync:
   # Non-inline file attachments (PDFs, decks, etc.) are not mirrored either way.
   include_attachments: false
 
-  # Only used by the opt-in poll mode (`npm start -- poll`), which loops sync
-  # forever at this cadence. The default `npm start` is one-shot — run it again
-  # whenever you want fresh docs.
-  poll_interval_seconds: 600
-
 # Each watch entry mirrors one Confluence page subtree (the root page plus
 # everything beneath it, any depth). Add more entries to mirror additional
 # roots. Find the page id in the URL (?pageId=NNNNN); if you only see the

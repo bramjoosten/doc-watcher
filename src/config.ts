@@ -28,9 +28,8 @@ export const configSchema = z.object({
       // startup when this is unset, and writes the chosen value back here.
       parallel_downloads: z.number().int().positive().optional(),
       include_attachments: z.boolean().default(false),
-      poll_interval_seconds: z.number().int().positive().default(600),
     })
-    .default({ include_attachments: false, poll_interval_seconds: 600 }),
+    .default({ include_attachments: false }),
   watch: z.array(watchSchema).min(1),
 });
 

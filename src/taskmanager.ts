@@ -103,7 +103,20 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
   const syncIso = new Date().toISOString();
   const result = await downloadPages(
     toFetch,
-    { config, client, outputDir, state, knownPagePaths, pagesWithChildren, titleIndex },
+    {
+      config,
+      client,
+      outputDir,
+      state,
+      knownPagePaths,
+      pagesWithChildren,
+      titleIndex,
+      // Flush after every successful page so an interrupt is resumable.
+      // `last_sync` stays at its previous value until the end of this run,
+      // so on resume the same CQL diff is re-issued; pages already in state
+      // are skipped via the version check.
+      flushState: () => writeState(stateDir, state),
+    },
     syncIso,
   );
 
@@ -204,13 +217,24 @@ async function runBench(): Promise<void> {
     elapsedMs: number;
     errors: number;
     throughputPerSec: number;
+    firstError?: string;
   }
   const results: BenchRow[] = [];
+
+  const errToString = (err: unknown): string => {
+    if (err instanceof Error) return err.message;
+    try {
+      return String(err);
+    } catch {
+      return '(unprintable error)';
+    }
+  };
 
   for (const c of BENCH_CONCURRENCY_LEVELS) {
     const limiter = pLimit(c);
     const start = Date.now();
     let errors = 0;
+    let firstError: string | undefined;
     await Promise.all(
       sample.map((p) =>
         limiter(async () => {
@@ -218,8 +242,9 @@ async function runBench(): Promise<void> {
             // Bypass the client's 429/503 retry — bench needs to see the
             // rate-limit cliff, not have it smoothed over.
             await client.getPage(p.id, undefined, { retry: false });
-          } catch {
+          } catch (err) {
             errors++;
+            if (!firstError) firstError = errToString(err);
           }
         }),
       ),
@@ -227,21 +252,28 @@ async function runBench(): Promise<void> {
     const elapsedMs = Date.now() - start;
     const throughputPerSec = sample.length / (elapsedMs / 1000);
     const rounded = Number(throughputPerSec.toFixed(2));
-    results.push({ concurrency: c, elapsedMs, errors, throughputPerSec: rounded });
+    results.push({ concurrency: c, elapsedMs, errors, throughputPerSec: rounded, firstError });
     log.info(
-      { concurrency: c, elapsedMs, errors, throughputPerSec: rounded },
+      { concurrency: c, elapsedMs, errors, throughputPerSec: rounded, firstError },
       `bench level done — parallel_downloads = ${c} → ${rounded} pages/s` +
-        (errors > 0 ? ` (${errors} error(s))` : ''),
+        (errors > 0 ? ` (${errors} error(s); first: ${firstError ?? '?'})` : ''),
     );
     if (errors > 0) {
-      log.warn({ concurrency: c, errors }, 'errors at this level; stopping sweep');
+      log.warn({ concurrency: c, errors, firstError }, 'errors at this level; stopping sweep');
       break;
     }
   }
 
   const candidates = results.filter((r) => r.errors === 0);
   if (candidates.length === 0) {
-    log.error('every concurrency level produced errors; not writing config');
+    const errored = results.find((r) => r.errors > 0);
+    log.error(
+      { results, firstError: errored?.firstError },
+      `every concurrency level produced errors. First error seen: ${errored?.firstError ?? '(none captured)'}. ` +
+        `Common causes: 403 = PAT lacks read access to one of the sample pages; ` +
+        `429/503 = server is hard-throttling (try again later, or set parallel_downloads = 1 manually); ` +
+        `4xx other = malformed request (bug, report it). Not writing config.`,
+    );
     process.exitCode = 1;
     return;
   }
@@ -335,23 +367,9 @@ async function runReconvert(): Promise<void> {
   log.info({ processed, skipped }, 'reconvert complete');
 }
 
-async function runPoll(): Promise<void> {
-  const { config } = await loadConfig();
-  const intervalMs = config.sync.poll_interval_seconds * 1000;
-  log.info({ intervalSec: config.sync.poll_interval_seconds }, 'poll daemon starting');
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    try {
-      await runSync({ full: false });
-    } catch (err) {
-      log.error({ err }, 'sync iteration failed');
-    }
-    await new Promise<void>((res) => setTimeout(res, intervalMs));
-  }
-}
 
 function usage(): void {
-  console.error('usage: npm start -- <sync|refresh|reconvert|poll> [--force-full-enumeration]');
+  console.error('usage: npm start -- <sync|refresh|reconvert> [--force-full-enumeration]');
   console.error('default (no args): sync  (incremental — does the initial download on first run)');
   console.error('autotune runs automatically when parallel_downloads is unset in config.yaml.');
 }
@@ -369,9 +387,6 @@ const forceFullEnumeration = rest.includes('--force-full-enumeration');
       break;
     case 'reconvert':
       await runReconvert();
-      break;
-    case 'poll':
-      await runPoll();
       break;
     case '--help':
     case '-h':

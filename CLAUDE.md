@@ -35,6 +35,8 @@ Node.js, TypeScript, run via `tsx`.
 
 The `.md` files have **no YAML frontmatter** — they're plain prose, easier for grep, editors, and LLMs to consume. All structural metadata (Confluence ID, version, ancestors, last-modified, links, embeds) lives in `<state_dir>/index.json`, with one entry per page keyed by Confluence ID. The state file is the source of truth for change detection and link resolution; the on-disk tree is the human-facing view derived from it. Writes are atomic via `tmp` + `rename` — interrupted runs never leave a half-written state file.
 
+State is **flushed after every successful page write** during a sync, not just at the end. So an interrupt (Ctrl+C, crash, network failure) leaves the state file reflecting exactly the pages already on disk. The next `npm start` re-queries the same CQL window (last_sync doesn't advance until the sync completes), diffs against the persisted per-page versions, and only fetches the pages not yet recorded. Resume is automatic — no `--resume` flag, no special verb.
+
 JSON over SQLite is deliberate: doc-watcher is single-process and the whole state is small (a few hundred KB even for 10k pages), so the durability and concurrency advantages of an embedded DB don't pay back the cost of a native dependency that may not install on locked-down corporate machines.
 
 **Source-URL header.** The first line of every converted `.md` is a markdown autolink to the Confluence source page, e.g. `<https://confluence.example.com/pages/viewpage.action?pageId=12345>`. It renders as a clickable link in any markdown viewer, keeps the file traceable on its own, and is regenerated during `reconvert`. Beyond this single line the body is unadorned markdown.
@@ -51,7 +53,7 @@ doc-watcher/
 ├── config.yaml                     # gitignored — base_url, pat, watch roots, etc.
 ├── .gitignore                      # ignores config.yaml, docs/, .state/, .claude/, node_modules/
 └── src/
-    ├── taskmanager.ts              # entry point: sync / refresh / reconvert / poll
+    ├── taskmanager.ts              # entry point: sync / refresh / reconvert
     ├── config.ts                   # zod schema, YAML loader
     ├── confluence.ts               # REST client (typed wrappers around fetch)
     ├── walker.ts                   # expand watch scopes → page id list (CQL)
@@ -120,7 +122,6 @@ Verbs:
 - **`sync`** (default): autotune if needed → build CQL with `lastmodified` lower bound, page through results, diff against state, fetch changed pages in parallel, write both `.html` and `.md`, atomic state-file replace at the end.
 - **`refresh`**: same as `sync` but ignores `last_sync` (full re-download).
 - **`reconvert`**: walk every `.html` already on disk and regenerate the `.md` next to it. No network calls. Used after a converter change.
-- **`poll`**: `while (true) { await sync(); await sleep(poll_interval); }`. Opt-in long-running mode — not the default. Doc-watcher is read-only for now, so there's no urgency to be live; the `poll` shape becomes more useful once write-back ships.
 
 Setup is manual: copy `config.example.yaml` → `config.yaml` and fill in the placeholders (`base_url`, `pat`, `watch[].root_page_id`). No `init` verb — fewer moving parts.
 
