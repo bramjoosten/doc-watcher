@@ -15,13 +15,8 @@ paths:
   cache_html: false
 
 sync:
-  # parallel_downloads is the number of concurrent page fetches.
-  # Left commented out by default so the first `npm start` runs an autotune —
-  # doc-watcher benchmarks a few values, picks the fastest one that doesn't
-  # trip rate limits, and writes the chosen number back here (uncommented).
-  # To force a re-bench later, comment this line out (or delete it) and rerun.
-  # To pin a specific value instead, uncomment and set it (e.g. 10 is a safe
-  # starting point on most networks); a hand-set value is not overwritten.
+  # Comment this out to trigger a benchmark; the benchmark will uncomment it
+  # with a calculated value. Or set your own.
   # parallel_downloads: 10
 
   # Inline images referenced via ac:image macros. Set to true once you've gauged
