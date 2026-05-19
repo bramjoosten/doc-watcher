@@ -29,7 +29,19 @@ function buildFullEnumerationCQL(watch: WatchEntry): string {
   return `(id = ${watch.root_page_id} OR ancestor = ${watch.root_page_id}) AND type = page`;
 }
 
+async function ensureTuned(): Promise<void> {
+  const { config } = await loadConfig();
+  if (config.sync.parallel_downloads && config.sync.parallel_downloads > 0) return;
+  log.info('parallel_downloads not set in config.toml — running autotune (one-time)');
+  try {
+    await runBench();
+  } catch (err) {
+    log.warn({ err }, 'autotune failed; sync will fall back to a heuristic this run');
+  }
+}
+
 async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }): Promise<void> {
+  await ensureTuned();
   const { config, pat, rootDir } = await loadConfig();
   const stateDir = resolve(rootDir, config.paths.state_dir);
   const outputDir = resolve(rootDir, config.paths.output_dir);
@@ -332,14 +344,14 @@ async function runPoll(): Promise<void> {
 
 function usage(): void {
   console.error('usage: npm start -- <init|sync|refresh|reconvert|bench|poll> [--force-full-enumeration]');
-  console.error('default (no args): poll  (initial sync, then loop forever)');
+  console.error('default (no args): sync  (incremental — does the initial download on first run)');
 }
 
 const [, , cmd, ...rest] = process.argv;
 const forceFullEnumeration = rest.includes('--force-full-enumeration');
 
 (async () => {
-  switch (cmd ?? 'poll') {
+  switch (cmd ?? 'sync') {
     case 'init':
       await runInit();
       break;

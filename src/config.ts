@@ -33,11 +33,13 @@ export const configSchema = z.object({
     .default({ output_dir: './docs', state_dir: './.state', cache_html: false }),
   sync: z
     .object({
-      parallel_downloads: z.number().int().positive().default(10),
-      include_attachments: z.boolean().default(true),
+      // Missing/undefined = "needs autotune". `npm start` runs `bench` on startup
+      // when this is unset, and bench writes the chosen value back into config.toml.
+      parallel_downloads: z.number().int().positive().optional(),
+      include_attachments: z.boolean().default(false),
       poll_interval_seconds: z.number().int().positive().default(600),
     })
-    .default({ parallel_downloads: 10, include_attachments: true, poll_interval_seconds: 600 }),
+    .default({ include_attachments: false, poll_interval_seconds: 600 }),
   watch: z.array(watchSchema).min(1),
 });
 

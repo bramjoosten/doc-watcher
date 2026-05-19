@@ -21,9 +21,11 @@ npm start -- init
 npm start
 ```
 
-That's the daily-driver mode: an initial sync, then a polling loop. The first run also benchmarks download concurrency on a sample of pages and writes the chosen value into `config.toml` under `[sync]`, so future runs reuse it. Delete that key to re-bench; edit it by hand to pin a value.
+That's the daily-driver. With no args it runs an **incremental sync** — the first invocation does the bulk download (state is empty), every subsequent run only fetches pages that changed since the last sync. Then it exits. Run it again whenever you want fresh docs.
 
-To leave it running, drop it under launchd / systemd / a tmux session. There's no cron: the process is the watcher.
+The very first run also benchmarks download concurrency on a sample of pages and writes the chosen value into `config.toml` under `[sync]`, so future runs reuse it. Delete that key to re-bench; edit it by hand to pin a specific value.
+
+There's an opt-in `poll` mode (`npm start -- poll`) that loops sync forever, but it's not the default — `doc-watcher` is read-only for now, so there's no urgency to be live.
 
 ## One-shot verbs
 

@@ -1,4 +1,5 @@
 import { mkdir, writeFile } from 'node:fs/promises';
+import { cpus } from 'node:os';
 import { dirname, join, posix } from 'node:path';
 import { pLimit, type LimitFunction } from './limit.js';
 import type { Config } from './config.js';
@@ -173,8 +174,14 @@ async function fetchAndWriteOne(
   return { relPath, attachments: attachmentRefs };
 }
 
+// Used if autotune hasn't run yet (or failed) and config has no value.
+function fallbackParallelDownloads(): number {
+  return Math.min(50, Math.max(4, (cpus()?.length ?? 4) * 2));
+}
+
 export async function downloadPages(pages: ConfluencePage[], opts: DownloadOptions, syncIso: string): Promise<DownloadResult> {
-  const limiter = pLimit(opts.config.sync.parallel_downloads);
+  const limit = opts.config.sync.parallel_downloads ?? fallbackParallelDownloads();
+  const limiter = pLimit(limit);
   const written: string[] = [];
   const attachments: string[] = [];
   const errors: { id: string; error: unknown }[] = [];

@@ -11,7 +11,7 @@ Node.js, TypeScript, run via `tsx`.
 - **Fast (parallel downloads).** A space can hold thousands of pages. The fetcher runs requests in parallel with bounded concurrency — enough to keep the network pipe full, not enough to get rate-limited.
 - **Keep in sync.** Cheap re-runs that only fetch what changed since the last sync (using each page's `lastmodified` timestamp, queried via CQL). Removes pages that have been deleted or moved out of scope. Two runs back-to-back should produce identical output.
 - **Node.js only (no Python).** Many organisations keep their stack narrow. Ruling out Python up front means doc-watcher drops into any Node-based environment without adding a runtime.
-- **Keep the source HTML alongside the markdown.** For each page we save both `<file>.html` (the raw Confluence storage-format response) and `<file>.md` (the readable conversion). The HTML is the durable source of truth; the markdown is a regeneratable view. Conversion runs through a deterministic script (cheerio + turndown + a macro registry), never an LLM, so re-running the converter on the saved HTML always produces the same markdown. If a future converter improvement lands, the corpus can be re-derived without re-hitting Confluence.
+- **Keep the source HTML alongside the markdown.** For each page we save both `<file>.html` (the raw Confluence storage-format response) and `<file>.md` (the readable conversion). The HTML is the durable source of truth; the markdown is a regeneratable view. Conversion runs through a deterministic script (cheerio + an in-house HTML→Markdown walker + a macro registry), never an LLM, so re-running the converter on the saved HTML always produces the same markdown. If a future converter improvement lands, the corpus can be re-derived without re-hitting Confluence.
 
 ### Nice-to-have
 
@@ -25,7 +25,7 @@ Node.js, TypeScript, run via `tsx`.
 - **Node 22+** with **TypeScript**, run via `tsx` in dev (no build step).
 - Built-in `fetch` (undici); a 15-line inline `pLimit` helper for bounded-concurrency parallel downloads.
 - `cheerio` for parsing Confluence storage-format XHTML.
-- `turndown` for HTML → Markdown, with custom rules for Confluence macros.
+- In-house HTML→Markdown walker in `converter.ts` (no `turndown` — DOM-lib transitive deps kept tripping corp security scanners).
 - `zod` for typed config validation; `smol-toml` for TOML parsing.
 - `.env` loaded via Node's built-in `--env-file-if-exists` flag — no `dotenv` dep.
 
@@ -57,7 +57,7 @@ doc-watcher/
     ├── confluence.ts               # REST client (typed wrappers around fetch)
     ├── walker.ts                   # expand watch scopes → page id list (CQL)
     ├── downloader.ts               # parallel fetch + write, p-limit-bounded
-    ├── converter.ts                # storage-format → markdown via cheerio + turndown
+    ├── converter.ts                # storage-format → markdown: cheerio macro pre-pass + in-house walker
     ├── pathing.ts                  # title → slug, rename detection
     ├── limit.ts                    # inline pLimit (bounded concurrency)
     ├── state.ts                    # JSON state file: read, atomic write
@@ -108,21 +108,21 @@ Auth: `Authorization: Bearer $CONFLUENCE_PAT` on every request.
 
 ### Converter
 
-Confluence "storage format" is XHTML with `<ac:structured-macro>` extensions. A pre-pass with cheerio rewrites macros to plain HTML, then turndown converts to markdown. A registry of macro handlers covers code blocks, callouts (info/warning/note), images and attachments, internal links, iframes/embeds, status badges, task lists, user mentions, and emoticons. Unknown macros become HTML comments — visible but inert.
+Confluence "storage format" is XHTML with `<ac:structured-macro>` extensions. A pre-pass with cheerio rewrites macros to plain HTML, then an in-house walker emits markdown. A registry of macro handlers covers code blocks, callouts (info/warning/note), images and attachments, internal links, iframes/embeds, status badges, task lists, user mentions, and emoticons. Unknown macros become HTML comments — visible but inert. The walker handles the standard HTML tag set (p, h1–h6, ul/ol/li with nesting, strong/em/code, pre+code with language hint, a, img, blockquote with our callout data attribute, GFM tables, hr, br).
 
 Always deterministic, always replayable. The `.html` file on disk is what the converter ran against; given the same HTML and the same converter version, you get the same `.md`.
 
 ### Core flows
 
-**`npm start`** is the daily driver: it runs an initial `sync` (full enumeration if state is empty, incremental otherwise), then enters the polling loop. The first run does the bulk download; everything after is cheap deltas. This is the "set it and forget it" mode.
+**`npm start`** is the daily driver. With no args it runs `sync`: incremental if state exists, full enumeration if it doesn't (so the first invocation does the bulk download). It also triggers `bench` automatically if `parallel_downloads` is unset in `config.toml`. Run it again whenever you want fresh docs — subsequent runs only fetch what changed.
 
-Verbs available when you want a one-shot operation instead:
+Verbs:
 
-- **`sync`** (incremental): build CQL with `lastmodified` lower bound, page through results, diff against state, fetch changed pages in parallel, write both `.html` and `.md`, atomic state-file replace at the end.
+- **`sync`** (default): autotune if needed → build CQL with `lastmodified` lower bound, page through results, diff against state, fetch changed pages in parallel, write both `.html` and `.md`, atomic state-file replace at the end.
 - **`refresh`**: same as `sync` but ignores `last_sync` (full re-download).
 - **`reconvert`**: walk every `.html` already on disk and regenerate the `.md` next to it. No network calls. Used after a converter change.
-- **`poll`**: `while (true) { await sync(); await sleep(poll_interval); }`. Once-per-day full enumeration is built in so deletes get caught.
 - **`bench`**: re-run the concurrency autotune (see below) and persist the result.
+- **`poll`**: `while (true) { await sync(); await sleep(poll_interval); }`. Opt-in long-running mode — not the default. Doc-watcher is read-only for now, so there's no urgency to be live; the `poll` shape becomes more useful once write-back ships.
 - **`init`**: copy `config.example.toml` → `config.toml`, create `.env` template, scaffold dirs.
 
 ### Concurrency autotune

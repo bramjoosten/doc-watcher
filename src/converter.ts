@@ -1,14 +1,5 @@
 import * as cheerio from 'cheerio';
-import TurndownService from 'turndown';
-// @ts-expect-error - upstream package ships no type declarations
-import { gfm } from '@joplin/turndown-plugin-gfm';
-
-interface AttrNode {
-  nodeName: string;
-  firstChild?: AttrNode | null;
-  textContent?: string | null;
-  getAttribute?: (name: string) => string | null;
-}
+import type { AnyNode, Element, Text } from 'domhandler';
 
 export interface ImageRef {
   filename: string;
@@ -51,21 +42,19 @@ function loadStorageFormat(html: string) {
   return cheerio.load(`<root>${html}</root>`, { xml: { decodeEntities: false } });
 }
 
-function getMacroParameter($: ReturnType<typeof loadStorageFormat>, macro: cheerio.Cheerio<any>, name: string): string | undefined {
+function getMacroParameter($: ReturnType<typeof loadStorageFormat>, macro: cheerio.Cheerio<AnyNode>, name: string): string | undefined {
   const param = macro.children(`ac\\:parameter[ac\\:name="${name}"]`).first();
   if (param.length === 0) return undefined;
   return param.text();
 }
 
-// plain-text-body wraps content in CDATA — cheerio's .html() returns the literal CDATA marker,
-// so we read the decoded text instead. rich-text-body holds real XHTML, so we keep .html().
-function getPlainTextBody(macro: cheerio.Cheerio<any>): string {
+function getPlainTextBody(macro: cheerio.Cheerio<AnyNode>): string {
   const body = macro.children('ac\\:plain-text-body').first();
   if (body.length === 0) return '';
   return body.text();
 }
 
-function getRichTextBody(macro: cheerio.Cheerio<any>): string {
+function getRichTextBody(macro: cheerio.Cheerio<AnyNode>): string {
   const body = macro.children('ac\\:rich-text-body').first();
   if (body.length === 0) return '';
   return body.html() ?? '';
@@ -152,7 +141,6 @@ export function preprocessStorageFormat(
     node.replaceWith(a);
   });
 
-  // Strip remaining ac:/ri: tags so turndown produces clean output.
   $('ac\\:emoticon, ac\\:placeholder, ac\\:task-list, ac\\:inline-comment-marker').each((_, el) => {
     const node = $(el);
     node.replaceWith(node.text());
@@ -162,47 +150,235 @@ export function preprocessStorageFormat(
   return { html: root.html() ?? '', images, pageLinks, unsupportedMacros };
 }
 
-export function buildTurndown(): TurndownService {
-  const td = new TurndownService({
-    headingStyle: 'atx',
-    codeBlockStyle: 'fenced',
-    bulletListMarker: '-',
-    emDelimiter: '_',
-  });
-  td.use(gfm);
+// ─── HTML → Markdown ───────────────────────────────────────────────────────
+// Replaces turndown. Walks the cheerio'd DOM and emits markdown directly.
+// Scope: the tag set produced by preprocessStorageFormat — p, h1–h6, ul/ol/li
+// (with nesting), strong/b, em/i, s/del, code, pre>code (with language hint),
+// a, img, blockquote (incl. data-callout), table (GFM), hr, br.
 
-  td.addRule('confluence-fenced-code', {
-    filter: (node) => node.nodeName === 'PRE' && (node as unknown as AttrNode).firstChild?.nodeName === 'CODE',
-    replacement: (_content, node) => {
-      const codeEl = (node as unknown as AttrNode).firstChild ?? null;
-      const className = codeEl?.getAttribute?.('class') ?? '';
-      const langMatch = /language-([\w+-]+)/.exec(className);
-      const lang = langMatch?.[1] ?? '';
-      const text = codeEl?.textContent ?? '';
-      return `\n\n\`\`\`${lang}\n${text.replace(/\n+$/, '')}\n\`\`\`\n\n`;
-    },
-  });
+interface RenderCtx {
+  listStack: Array<{ ordered: boolean; index: number }>;
+}
 
-  td.addRule('confluence-callout', {
-    filter: (node) =>
-      node.nodeName === 'BLOCKQUOTE' && (node as unknown as AttrNode).getAttribute?.('data-callout') != null,
-    replacement: (content, node) => {
-      const type = (node as unknown as AttrNode).getAttribute?.('data-callout') ?? 'NOTE';
-      const lines = content.trim().split('\n');
-      const body = lines.map((l) => `> ${l}`).join('\n');
-      return `\n\n> [!${type}]\n${body}\n\n`;
-    },
-  });
+function isTag(n: AnyNode | undefined | null): n is Element {
+  return !!n && n.type === 'tag';
+}
+function isText(n: AnyNode | undefined | null): n is Text {
+  return !!n && n.type === 'text';
+}
+function tagName(n: Element): string {
+  return n.name.toLowerCase();
+}
 
-  return td;
+// Escape the chars that markdown would otherwise interpret as syntax in prose.
+// Conservative on purpose — over-escaping uglies normal text.
+function escapeText(s: string): string {
+  return s.replace(/([\\`*_])/g, '\\$1');
+}
+
+function renderInline(node: AnyNode, ctx: RenderCtx): string {
+  if (isText(node)) return escapeText(node.data);
+  if (!isTag(node)) return '';
+  const tag = tagName(node);
+  const children = () => (node.children ?? []).map((c) => renderInline(c, ctx)).join('');
+  switch (tag) {
+    case 'strong':
+    case 'b':
+      return `**${children()}**`;
+    case 'em':
+    case 'i':
+      return `_${children()}_`;
+    case 's':
+    case 'del':
+    case 'strike':
+      return `~~${children()}~~`;
+    case 'code': {
+      const raw = (node.children ?? []).map((c) => (isText(c) ? c.data : '')).join('');
+      return `\`${raw}\``;
+    }
+    case 'a': {
+      const href = node.attribs?.href ?? '';
+      const text = children() || href;
+      return `[${text}](${href})`;
+    }
+    case 'img': {
+      const src = node.attribs?.src ?? '';
+      const alt = node.attribs?.alt ?? '';
+      return `![${alt}](${src})`;
+    }
+    case 'br':
+      return '  \n';
+    case 'span':
+    case 'sub':
+    case 'sup':
+    case 'u':
+    case 'mark':
+    case 'small':
+      return children();
+    default:
+      return children();
+  }
+}
+
+function renderBlock(node: AnyNode, ctx: RenderCtx): string {
+  if (isText(node)) return /^\s*$/.test(node.data) ? '' : escapeText(node.data);
+  if (!isTag(node)) return '';
+  const tag = tagName(node);
+  const inlineKids = () => (node.children ?? []).map((c) => renderInline(c, ctx)).join('').trim();
+  const blockKids = () => (node.children ?? []).map((c) => renderBlock(c, ctx)).join('');
+
+  switch (tag) {
+    case 'p':
+      return inlineKids() + '\n\n';
+    case 'h1':
+    case 'h2':
+    case 'h3':
+    case 'h4':
+    case 'h5':
+    case 'h6': {
+      const level = Number.parseInt(tag.charAt(1), 10);
+      return `${'#'.repeat(level)} ${inlineKids()}\n\n`;
+    }
+    case 'hr':
+      return '---\n\n';
+    case 'br':
+      return '  \n';
+    case 'pre': {
+      const code = (node.children ?? []).find((c) => isTag(c) && tagName(c) === 'code');
+      if (isTag(code)) {
+        const className = code.attribs?.class ?? '';
+        const langMatch = /language-([\w+-]+)/.exec(className);
+        const lang = langMatch?.[1] ?? '';
+        const text = (code.children ?? []).map((c) => (isText(c) ? c.data : '')).join('');
+        return `\`\`\`${lang}\n${text.replace(/\n+$/, '')}\n\`\`\`\n\n`;
+      }
+      const text = (node.children ?? []).map((c) => (isText(c) ? c.data : '')).join('');
+      return `\`\`\`\n${text.replace(/\n+$/, '')}\n\`\`\`\n\n`;
+    }
+    case 'blockquote': {
+      const callout = node.attribs?.['data-callout'];
+      const content = blockKids().trim();
+      const quoted = content.split('\n').map((l) => `> ${l}`).join('\n');
+      if (callout) return `> [!${callout}]\n${quoted}\n\n`;
+      return `${quoted}\n\n`;
+    }
+    case 'ul':
+    case 'ol':
+      return renderList(node, ctx, tag === 'ol');
+    case 'table':
+      return renderTable(node, ctx);
+    case 'div':
+    case 'section':
+    case 'article':
+    case 'main':
+    case 'header':
+    case 'footer':
+      return blockKids();
+    // Inline-ish tags showing up as block-level: emit as inline + paragraph break.
+    case 'a':
+    case 'strong':
+    case 'b':
+    case 'em':
+    case 'i':
+    case 'code':
+    case 'img':
+    case 's':
+    case 'del':
+    case 'span':
+      return renderInline(node, ctx) + '\n\n';
+    default:
+      return blockKids();
+  }
+}
+
+function renderList(node: Element, ctx: RenderCtx, ordered: boolean): string {
+  ctx.listStack.push({ ordered, index: 0 });
+  const indent = '  '.repeat(ctx.listStack.length - 1);
+  let out = '';
+  for (const child of node.children ?? []) {
+    if (!isTag(child) || tagName(child) !== 'li') continue;
+    ctx.listStack[ctx.listStack.length - 1]!.index++;
+    const marker = ordered ? `${ctx.listStack[ctx.listStack.length - 1]!.index}. ` : '- ';
+    // Split the li into inline content vs. nested lists.
+    const inlineParts: string[] = [];
+    const nestedParts: string[] = [];
+    for (const c of child.children ?? []) {
+      if (isTag(c) && (tagName(c) === 'ul' || tagName(c) === 'ol')) {
+        nestedParts.push(renderList(c, ctx, tagName(c) === 'ol'));
+      } else {
+        inlineParts.push(renderInline(c, ctx));
+      }
+    }
+    const inlineText = inlineParts.join('').trim();
+    out += `${indent}${marker}${inlineText}\n`;
+    out += nestedParts.join('');
+  }
+  ctx.listStack.pop();
+  // Trailing blank line only when we close the outermost list.
+  return ctx.listStack.length === 0 ? out + '\n' : out;
+}
+
+function renderTable(node: Element, ctx: RenderCtx): string {
+  const collectRow = (tr: Element): string[] =>
+    (tr.children ?? [])
+      .filter((c): c is Element => isTag(c) && (tagName(c) === 'td' || tagName(c) === 'th'))
+      .map((cell) =>
+        renderInline(cell as AnyNode, ctx)
+          .trim()
+          .replace(/\|/g, '\\|')
+          .replace(/\n/g, ' '),
+      );
+
+  let header: string[] | null = null;
+  const rows: string[][] = [];
+  for (const child of node.children ?? []) {
+    if (!isTag(child)) continue;
+    const name = tagName(child);
+    if (name === 'thead') {
+      for (const tr of child.children ?? []) {
+        if (isTag(tr) && tagName(tr) === 'tr') {
+          header = collectRow(tr);
+          break;
+        }
+      }
+    } else if (name === 'tbody') {
+      for (const tr of child.children ?? []) {
+        if (isTag(tr) && tagName(tr) === 'tr') rows.push(collectRow(tr));
+      }
+    } else if (name === 'tr') {
+      const row = collectRow(child);
+      if (!header) header = row;
+      else rows.push(row);
+    }
+  }
+
+  if (!header || header.length === 0) return '';
+  const cols = header.length;
+  const lines: string[] = [
+    `| ${header.join(' | ')} |`,
+    `| ${Array(cols).fill('---').join(' | ')} |`,
+  ];
+  for (const row of rows) {
+    const padded = row.concat(Array(Math.max(0, cols - row.length)).fill(''));
+    lines.push(`| ${padded.slice(0, cols).join(' | ')} |`);
+  }
+  return `${lines.join('\n')}\n\n`;
+}
+
+export function htmlToMarkdown(html: string): string {
+  const $ = cheerio.load(`<root>${html}</root>`, { xml: { decodeEntities: true } });
+  const root = $('root')[0];
+  if (!isTag(root)) return '';
+  const ctx: RenderCtx = { listStack: [] };
+  const out = (root.children ?? []).map((c) => renderBlock(c, ctx)).join('');
+  // Collapse 3+ newlines to 2, trim leading/trailing whitespace.
+  return out.replace(/\n{3,}/g, '\n\n').trim();
 }
 
 export function convertStorageFormat(html: string, opts: ConvertOptions): ConvertResult {
   const pre = preprocessStorageFormat(html, opts);
-  const td = buildTurndown();
-  const markdown = td.turndown(pre.html).trim();
   return {
-    markdown,
+    markdown: htmlToMarkdown(pre.html),
     images: pre.images,
     pageLinks: pre.pageLinks,
     unsupportedMacros: pre.unsupportedMacros,
