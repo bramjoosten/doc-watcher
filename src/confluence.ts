@@ -77,14 +77,16 @@ export class ConfluenceClient {
   }
 
   // fetch wrapper that retries 429 and 503 with backoff. Honours Retry-After;
-  // falls back to exponential (1s, 2s, 4s, 8s, 16s, capped at 60s). Max 5 retries
-  // then returns the last response (the caller's !res.ok branch will throw).
+  // falls back to exponential (1s, 2s, 4s, 8s, 16s, 32s, 60s, 60s capped). Max 8
+  // retries then returns the last response (the caller's !res.ok branch will throw).
+  // Bumped from 5 to 8 to handle sustained throttle storms where the server keeps
+  // issuing Retry-After's faster than one request can ride them out.
   private async fetchWithRetry(url: string, init: RequestInit): Promise<Response> {
     let attempt = 0;
     while (true) {
       const res = await fetch(url, init);
       if (res.status !== 429 && res.status !== 503) return res;
-      if (attempt >= 5) return res;
+      if (attempt >= 8) return res;
       const retryAfter = this.parseRetryAfter(res.headers.get('Retry-After'));
       const waitMs = retryAfter ?? Math.min(60_000, 1000 * 2 ** attempt);
       log.warn(

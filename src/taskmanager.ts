@@ -169,9 +169,27 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
 
   state.last_sync = syncIso;
   await writeState(stateDir, state);
+
+  // Summarise errors by leading prefix so a sea of failures shows its shape.
+  // e.g. "Confluence request failed: 429" → bucket "429".
+  const errorSummary: Record<string, number> = {};
+  for (const e of result.errors) {
+    const msg = e.error instanceof Error ? e.error.message : String(e.error);
+    const code = /\b(40\d|41\d|42\d|43\d|44\d|5\d\d)\b/.exec(msg)?.[1] ?? 'other';
+    errorSummary[code] = (errorSummary[code] ?? 0) + 1;
+  }
+
   log.info(
-    { written: result.written.length, attachments: result.attachments.length, errors: result.errors.length },
-    'sync complete',
+    {
+      written: result.written.length,
+      attachments: result.attachments.length,
+      errors: result.errors.length,
+      ...(result.errors.length > 0 ? { errorSummary } : {}),
+    },
+    `sync complete — written: ${result.written.length}, attachments: ${result.attachments.length}, errors: ${result.errors.length}` +
+      (result.errors.length > 0
+        ? ` (${Object.entries(errorSummary).map(([k, v]) => `${k}=${v}`).join(', ')}). Re-run \`npm start\` to retry the failed pages — state is per-page, so successful ones are skipped.`
+        : ''),
   );
 }
 
@@ -283,10 +301,24 @@ async function runBench(): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  const best = candidates.reduce((a, b) => (b.throughputPerSec > a.throughputPerSec ? b : a));
+  const peak = candidates.reduce((a, b) => (b.throughputPerSec > a.throughputPerSec ? b : a));
+  // Step one tier down from the peak for headroom. Bench measures *burst*
+  // tolerance on 30 pages; a full sync sustains the load over thousands of
+  // pages, and the server's token bucket only drains under sustained
+  // pressure. Picking the next tier down trades a slice of peak throughput
+  // for a much lower chance of cascading 429s mid-run.
+  const peakIdx = BENCH_CONCURRENCY_LEVELS.indexOf(peak.concurrency);
+  const safeIdx = Math.max(0, peakIdx - 1);
+  const safeLevel = BENCH_CONCURRENCY_LEVELS[safeIdx]!;
+  const best = candidates.find((r) => r.concurrency === safeLevel) ?? peak;
   log.info(
-    { winningConcurrency: best.concurrency, throughputPerSec: best.throughputPerSec },
-    `bench winner: parallel_downloads = ${best.concurrency}`,
+    {
+      peakConcurrency: peak.concurrency,
+      peakThroughputPerSec: peak.throughputPerSec,
+      chosenConcurrency: best.concurrency,
+    },
+    `bench: peak was parallel_downloads = ${peak.concurrency} (${peak.throughputPerSec} pages/s); ` +
+      `picking ${best.concurrency} one tier down for sustained-load headroom`,
   );
 
   // Match any existing line — commented or not — preserving leading indentation
