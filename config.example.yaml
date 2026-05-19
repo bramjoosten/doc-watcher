@@ -16,11 +16,13 @@ paths:
 
 sync:
   # parallel_downloads is the number of concurrent page fetches.
-  # Comment this line out (or delete it) to force an autotune on the next run —
-  # doc-watcher will benchmark a few values, pick the fastest one that doesn't
-  # trip rate limits, and write the result back here. Otherwise just set a
-  # reasonable number (10 is a safe starting point on most networks).
-  parallel_downloads: 10
+  # Left commented out by default so the first `npm start` runs an autotune —
+  # doc-watcher benchmarks a few values, picks the fastest one that doesn't
+  # trip rate limits, and writes the chosen number back here (uncommented).
+  # To force a re-bench later, comment this line out (or delete it) and rerun.
+  # To pin a specific value instead, uncomment and set it (e.g. 10 is a safe
+  # starting point on most networks); a hand-set value is not overwritten.
+  # parallel_downloads: 10
 
   # Inline images referenced via ac:image macros. Set to true once you've gauged
   # bandwidth on a small first sync — a space with diagrams can easily push tens of GB.
