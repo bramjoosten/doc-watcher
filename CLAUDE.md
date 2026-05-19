@@ -23,20 +23,21 @@ Node.js, TypeScript, run via `tsx`.
 ### Stack
 
 - **Node 22+** with **TypeScript**, run via `tsx` in dev (no build step).
-- Built-in `fetch` (undici) + `p-limit` for bounded-concurrency parallel downloads.
+- Built-in `fetch` (undici); a 15-line inline `pLimit` helper for bounded-concurrency parallel downloads.
 - `cheerio` for parsing Confluence storage-format XHTML.
 - `turndown` for HTML → Markdown, with custom rules for Confluence macros.
-- `better-sqlite3` for the local index.
 - `zod` for typed config validation; `smol-toml` for TOML parsing.
-- `dotenv` for loading `CONFLUENCE_PAT`.
+- `.env` loaded via Node's built-in `--env-file-if-exists` flag — no `dotenv` dep.
 
-**Minimize third-party dependencies.** Reach for the Node standard library first; a dep only earns its keep when the alternative would be hundreds of lines of nontrivial code (XHTML parsing, HTML→markdown conversion, SQLite bindings). The CLI is a plain Node entry point using `process.argv` — no `commander` / `yargs` / etc. Logging is `console.log` / `console.error`. No test framework for now.
+**Minimize third-party dependencies.** Reach for the Node standard library first; a dep only earns its keep when the alternative would be hundreds of lines of nontrivial code (XHTML parsing, HTML→markdown conversion). **No native modules** — the tool has to install on locked-down corporate machines where the npm proxy MITMs TLS and prebuilt binaries fail to download. Pure JavaScript across the board. The CLI is a plain Node entry point using `process.argv` — no `commander` / `yargs` / etc. Logging is `console.log` / `console.error`. No test framework for now.
 
-### State: SQLite, not frontmatter
+### State: plain JSON, not frontmatter
 
-The `.md` files have **no YAML frontmatter** — they're plain prose, easier for grep, editors, and LLMs to consume. All structural metadata (Confluence ID, version, ancestors, last-modified, links, embeds) lives in `docs/index.sqlite`, with one row per page keyed by Confluence ID. The SQLite file is the source of truth for change detection and link resolution; the on-disk tree is the human-facing view derived from it.
+The `.md` files have **no YAML frontmatter** — they're plain prose, easier for grep, editors, and LLMs to consume. All structural metadata (Confluence ID, version, ancestors, last-modified, links, embeds) lives in `<state_dir>/index.json`, with one entry per page keyed by Confluence ID. The state file is the source of truth for change detection and link resolution; the on-disk tree is the human-facing view derived from it. Writes are atomic via `tmp` + `rename` — interrupted runs never leave a half-written state file.
 
-**Source-URL header.** The first line of every converted `.md` is a markdown autolink to the Confluence source page, e.g. `<https://confluence.example.com/pages/viewpage.action?pageId=12345>`. It renders as a clickable link in any markdown viewer, keeps the file traceable when SQLite isn't at hand, and is regenerated from the database during `reconvert`. Beyond this single line the body is unadorned markdown.
+JSON over SQLite is deliberate: doc-watcher is single-process and the whole state is small (a few hundred KB even for 10k pages), so the durability and concurrency advantages of an embedded DB don't pay back the cost of a native dependency that may not install on locked-down corporate machines.
+
+**Source-URL header.** The first line of every converted `.md` is a markdown autolink to the Confluence source page, e.g. `<https://confluence.example.com/pages/viewpage.action?pageId=12345>`. It renders as a clickable link in any markdown viewer, keeps the file traceable on its own, and is regenerated during `reconvert`. Beyond this single line the body is unadorned markdown.
 
 ### File layout
 
@@ -58,15 +59,17 @@ doc-watcher/
     ├── downloader.ts               # parallel fetch + write, p-limit-bounded
     ├── converter.ts                # storage-format → markdown via cheerio + turndown
     ├── pathing.ts                  # title → slug, rename detection
-    ├── state.ts                    # better-sqlite3 wrapper, schema migrations
+    ├── limit.ts                    # inline pLimit (bounded concurrency)
+    ├── state.ts                    # JSON state file: read, atomic write
     └── log.ts
 ```
 
 ### Output layout (`docs/` mirrors Confluence)
 
 ```
+.state/
+  index.json                              # state + structural metadata
 docs/
-  index.sqlite                            # state + structural metadata
   ENG/                                    # space key
     _index.html / _index.md               # space homepage
     onboarding--67890/                    # parent page → folder; ID after `--`
@@ -76,9 +79,9 @@ docs/
     attachments/<page_id>/diagram.png
 ```
 
-**Filename rule.** Each page produces two files side-by-side: `<slug>--<id>.html` (raw Confluence storage format) and `<slug>--<id>.md` (derived markdown). Slug is the lowercase, kebab-cased, ASCII-folded page title. The `--<id>` suffix is the durable anchor — if the directory tree is ever rebuilt without SQLite, files can still be matched back to their Confluence pages by ID alone.
+**Filename rule.** Each page produces two files side-by-side: `<slug>--<id>.html` (raw Confluence storage format) and `<slug>--<id>.md` (derived markdown). Slug is the lowercase, kebab-cased, ASCII-folded page title. The `--<id>` suffix is the durable anchor — if the state file is ever lost, files can still be matched back to their Confluence pages by ID alone.
 
-**Page titles can change**, so filenames can change between syncs. The watcher detects renames via the SQLite row (keyed by ID): when title changes, it does the local rename (file or folder) without re-fetching the body. A re-parent moves the file or folder under a new parent. History is preserved if the user's `docs/` is under git.
+**Page titles can change**, so filenames can change between syncs. The watcher detects renames via the state entry (keyed by ID): when title changes, it does the local rename (file or folder) without re-fetching the body. A re-parent moves the file or folder under a new parent. History is preserved if the user's `docs/` is under git.
 
 **Parent vs leaf.** A page with children becomes a folder `<slug>--<id>/` containing `_index.html` and `_index.md`. A leaf is two flat files. This mirrors the way most static-site tools think about hierarchy.
 
@@ -90,7 +93,7 @@ Confluence Server has no dedicated sync endpoint, but CQL on `/rest/api/content/
 (space = "ENG" OR ancestor = 12345) AND type = page AND lastmodified >= "<last_sync_iso>"
 ```
 
-For a 10k-page space the typical delta per 5-minute window is 0–50 pages — sub-second API time. `sources.last_sync` in SQLite is the lower bound; first run has none and does a full enumeration. Every subsequent run is delta-only.
+For a 10k-page space the typical delta per 5-minute window is 0–50 pages — sub-second API time. `last_sync` in the state file is the lower bound; first run has none and does a full enumeration. Every subsequent run is delta-only.
 
 **Deletes** aren't visible in the incremental query (they're just absent). The default `sync` runs a cheap id-only full enumeration once per day to reconcile orphans (gated by `sources.last_full_enum`). `refresh` always does a full enumeration.
 
@@ -115,7 +118,7 @@ Always deterministic, always replayable. The `.html` file on disk is what the co
 
 Verbs available when you want a one-shot operation instead:
 
-- **`sync`** (incremental): build CQL with `lastmodified` lower bound, page through results, diff against SQLite, fetch changed pages in parallel, write both `.html` and `.md`, atomic file replace, commit SQLite transaction.
+- **`sync`** (incremental): build CQL with `lastmodified` lower bound, page through results, diff against state, fetch changed pages in parallel, write both `.html` and `.md`, atomic state-file replace at the end.
 - **`refresh`**: same as `sync` but ignores `last_sync` (full re-download).
 - **`reconvert`**: walk every `.html` already on disk and regenerate the `.md` next to it. No network calls. Used after a converter change.
 - **`poll`**: `while (true) { await sync(); await sleep(poll_interval); }`. Once-per-day full enumeration is built in so deletes get caught.

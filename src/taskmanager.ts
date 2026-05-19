@@ -2,7 +2,7 @@
 import { copyFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
-import pLimit from 'p-limit';
+import { pLimit } from './limit.js';
 import { loadConfig, type WatchEntry } from './config.js';
 import { ConfluenceClient } from './confluence.js';
 import { convertStorageFormat } from './converter.js';

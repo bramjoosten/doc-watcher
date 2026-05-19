@@ -40,8 +40,9 @@ For manual operations instead of leaving the watcher running:
 The local tree mirrors Confluence; each page's id is appended after `--` so title changes become clean `git mv`s. Every page produces two files side by side — `.html` (raw storage format, the source of truth) and `.md` (the human-readable view derived from it).
 
 ```
+.state/
+  index.json                          # state, page metadata, link resolution
 docs/
-  index.sqlite                        # state, page metadata, link resolution
   ENG/
     _index.html / _index.md
     onboarding--67890/
@@ -51,7 +52,7 @@ docs/
     attachments/67890/diagram.png
 ```
 
-The `.md` has no YAML frontmatter — just the page body, prefixed with a one-line autolink back to the Confluence source so anyone reading the file knows where it came from. All structured metadata (id, version, ancestors, links, embeds) lives in `index.sqlite`.
+The `.md` has no YAML frontmatter — just the page body, prefixed with a one-line autolink back to the Confluence source so anyone reading the file knows where it came from. All structured metadata (id, version, ancestors, links, embeds) lives in `.state/index.json`.
 
 ## Limitations
 

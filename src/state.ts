@@ -1,6 +1,5 @@
-import { mkdirSync } from 'node:fs';
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import Database from 'better-sqlite3';
 
 export interface PageState {
   version: number;
@@ -21,96 +20,31 @@ export function emptyState(): StateFile {
 }
 
 export function stateFilePath(stateDir: string): string {
-  return join(stateDir, 'index.sqlite');
-}
-
-function openDb(stateDir: string): Database.Database {
-  const path = stateFilePath(stateDir);
-  mkdirSync(dirname(path), { recursive: true });
-  const db = new Database(path);
-  db.pragma('journal_mode = WAL');
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS meta (
-      key   TEXT PRIMARY KEY,
-      value TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS pages (
-      id              TEXT PRIMARY KEY,
-      version         INTEGER NOT NULL,
-      path            TEXT NOT NULL,
-      title           TEXT NOT NULL,
-      space           TEXT NOT NULL,
-      ancestors_json  TEXT NOT NULL
-    );
-  `);
-  return db;
-}
-
-interface PageRow {
-  id: string;
-  version: number;
-  path: string;
-  title: string;
-  space: string;
-  ancestors_json: string;
+  return join(stateDir, 'index.json');
 }
 
 export async function readState(stateDir: string): Promise<StateFile> {
-  const db = openDb(stateDir);
+  const path = stateFilePath(stateDir);
   try {
-    const metaRows = db.prepare('SELECT key, value FROM meta').all() as { key: string; value: string }[];
-    const meta = new Map(metaRows.map((r) => [r.key, r.value]));
-    const pageRows = db
-      .prepare('SELECT id, version, path, title, space, ancestors_json FROM pages')
-      .all() as PageRow[];
-
-    const pages: Record<string, PageState> = {};
-    for (const r of pageRows) {
-      pages[r.id] = {
-        version: r.version,
-        path: r.path,
-        title: r.title,
-        space: r.space,
-        ancestors: JSON.parse(r.ancestors_json) as string[],
-      };
-    }
-
+    const buf = await readFile(path, 'utf8');
+    const parsed = JSON.parse(buf) as Partial<StateFile>;
     return {
-      last_sync: meta.get('last_sync') ?? null,
-      last_full_enumeration: meta.get('last_full_enumeration') ?? null,
-      pages,
+      last_sync: parsed.last_sync ?? null,
+      last_full_enumeration: parsed.last_full_enumeration ?? null,
+      pages: parsed.pages ?? {},
     };
-  } finally {
-    db.close();
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return emptyState();
+    throw err;
   }
 }
 
+// Atomic write: write to a sibling .tmp file, then rename. If the process dies
+// mid-write, the original file is intact and the .tmp is orphaned.
 export async function writeState(stateDir: string, state: StateFile): Promise<void> {
-  const db = openDb(stateDir);
-  try {
-    const upsertMeta = db.prepare(
-      'INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
-    );
-    const deleteMeta = db.prepare('DELETE FROM meta WHERE key = ?');
-    const clearPages = db.prepare('DELETE FROM pages');
-    const insertPage = db.prepare(
-      'INSERT INTO pages(id, version, path, title, space, ancestors_json) VALUES(?, ?, ?, ?, ?, ?)',
-    );
-
-    const tx = db.transaction(() => {
-      if (state.last_sync === null) deleteMeta.run('last_sync');
-      else upsertMeta.run('last_sync', state.last_sync);
-
-      if (state.last_full_enumeration === null) deleteMeta.run('last_full_enumeration');
-      else upsertMeta.run('last_full_enumeration', state.last_full_enumeration);
-
-      clearPages.run();
-      for (const [id, p] of Object.entries(state.pages)) {
-        insertPage.run(id, p.version, p.path, p.title, p.space, JSON.stringify(p.ancestors));
-      }
-    });
-    tx();
-  } finally {
-    db.close();
-  }
+  const path = stateFilePath(stateDir);
+  await mkdir(dirname(path), { recursive: true });
+  const tmp = `${path}.tmp`;
+  await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  await rename(tmp, path);
 }

@@ -2,7 +2,9 @@ import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { parse as parseToml } from 'smol-toml';
 import { z } from 'zod';
-import 'dotenv/config';
+
+// .env is loaded by Node's --env-file-if-exists flag (see package.json `start` script),
+// so process.env is already populated by the time this module runs.
 
 const watchSpaceSchema = z.object({
   type: z.literal('space'),

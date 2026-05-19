@@ -1,7 +1,6 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join, posix } from 'node:path';
-import pLimit from 'p-limit';
-import type { LimitFunction } from 'p-limit';
+import { pLimit, type LimitFunction } from './limit.js';
 import type { Config } from './config.js';
 import type { ConfluenceAttachment, ConfluenceClient, ConfluencePage } from './confluence.js';
 import { convertStorageFormat } from './converter.js';
