@@ -10,7 +10,11 @@ const ENABLED: Record<Level, boolean> = (() => {
 function emit(level: Level, a: unknown, b?: unknown): void {
   if (!ENABLED[level]) return;
   const stream = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log;
-  const ts = new Date().toISOString().slice(11, 19);
+  // Local wall-clock time. toISOString() is UTC and reads as "2 hours behind"
+  // for users east of Greenwich, which is confusing in tail-the-log workflows.
+  const d = new Date();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const ts = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
   if (typeof a === 'string') {
     stream(`${ts} ${level} ${a}`);
   } else {

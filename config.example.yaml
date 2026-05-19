@@ -7,7 +7,10 @@ confluence:
   # The token is shown only once on creation — paste it here before closing the dialog.
   pat: ""
 
-  verify_tls: true
+  # TLS verification is always on. If your Confluence uses a corporate / private
+  # CA that Node doesn't trust by default, point Node at the CA bundle instead
+  # of disabling verification:
+  #   NODE_EXTRA_CA_CERTS=/path/to/corp-ca.pem npm start
 
 paths:
   output_dir: ./docs

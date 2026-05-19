@@ -63,7 +63,6 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
   const client = new ConfluenceClient({
     baseUrl: config.confluence.base_url,
     pat: config.confluence.pat,
-    verifyTls: config.confluence.verify_tls,
   });
 
   const since = opts.full ? undefined : state.last_sync ?? undefined;
@@ -104,7 +103,14 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
     return !prev || prev.version !== (p.version?.number ?? 0);
   });
 
-  log.info({ candidates: seen.size, toFetch: toFetch.length }, 'sync diff');
+  // Split the work into new vs. updated for the post-sync summary.
+  const newPageIds = new Set(toFetch.filter((p) => !state.pages[p.id]).map((p) => p.id));
+  const updatedPageIds = new Set(toFetch.filter((p) => state.pages[p.id]).map((p) => p.id));
+
+  log.info(
+    { candidates: seen.size, toFetch: toFetch.length, new: newPageIds.size, updated: updatedPageIds.size },
+    'sync diff',
+  );
 
   const syncIso = new Date().toISOString();
   const result = await downloadPages(
@@ -135,6 +141,7 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
   const daily = Number.isNaN(lastFull) || Date.now() - lastFull > FULL_ENUMERATION_INTERVAL_MS;
   const doFullEnumeration = opts.full || since === undefined || opts.forceFullEnumeration === true || daily;
 
+  let deletedCount = 0;
   if (doFullEnumeration) {
     let allIds: Set<string>;
     if (opts.full || since === undefined) {
@@ -152,6 +159,7 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
     }
 
     const toDelete = Object.keys(state.pages).filter((id) => !allIds.has(id));
+    deletedCount = toDelete.length;
     for (const id of toDelete) {
       const st = state.pages[id];
       if (!st) continue;
@@ -170,8 +178,28 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
   state.last_sync = syncIso;
   await writeState(stateDir, state);
 
-  // Summarise errors by leading prefix so a sea of failures shows its shape.
-  // e.g. "Confluence request failed: 429" → bucket "429".
+  // Count how much of toFetch landed successfully, split by new vs updated.
+  const writtenSet = new Set(result.written);
+  // result.written is relPaths, not ids. Cross-reference via state.pages.
+  // Simpler: derive succeeded-by-id from state.pages updates within toFetch.
+  // After downloadPages, every page it successfully wrote was inserted into
+  // state.pages with its new version. We compare against the per-id sets.
+  // But toFetch's "new" entries didn't exist before, so a successful write
+  // is detectable by state.pages[id] being present. Updated entries already
+  // existed but got their version bumped — also detectable.
+  // We didn't capture the pre-fetch versions for `updated` though. Instead,
+  // attribute by ids: successful = ids whose path now matches result.written,
+  // and split by membership in newPageIds / updatedPageIds.
+  const succeededIds = new Set<string>();
+  for (const [id, st] of Object.entries(state.pages)) {
+    if (writtenSet.has(st.path)) succeededIds.add(id);
+  }
+  const addedCount = [...newPageIds].filter((id) => succeededIds.has(id)).length;
+  const updatedCount = [...updatedPageIds].filter((id) => succeededIds.has(id)).length;
+  const totalChanges = addedCount + updatedCount + deletedCount;
+  const isFirstSync = since === undefined;
+
+  // Bucket errors by HTTP status so a sea of failures shows its shape.
   const errorSummary: Record<string, number> = {};
   for (const e of result.errors) {
     const msg = e.error instanceof Error ? e.error.message : String(e.error);
@@ -179,17 +207,35 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
     errorSummary[code] = (errorSummary[code] ?? 0) + 1;
   }
 
+  // Build a human-readable headline.
+  let headline: string;
+  if (isFirstSync) {
+    headline = `initial sync complete — ${addedCount} page${addedCount === 1 ? '' : 's'} downloaded`;
+  } else if (totalChanges === 0 && result.errors.length === 0) {
+    headline = 'no changes since your last run';
+  } else {
+    const parts: string[] = [];
+    if (addedCount > 0) parts.push(`${addedCount} new`);
+    if (updatedCount > 0) parts.push(`${updatedCount} updated`);
+    if (deletedCount > 0) parts.push(`${deletedCount} deleted`);
+    const breakdown = parts.length > 0 ? ` (${parts.join(', ')})` : '';
+    headline = `${totalChanges} change${totalChanges === 1 ? '' : 's'} since your last run${breakdown}`;
+  }
+  if (result.errors.length > 0) {
+    const errParts = Object.entries(errorSummary).map(([k, v]) => `${k}=${v}`).join(', ');
+    headline += `. ${result.errors.length} error${result.errors.length === 1 ? '' : 's'} (${errParts}) — re-run \`npm start\` to retry; successful pages are skipped.`;
+  }
+
   log.info(
     {
-      written: result.written.length,
+      added: addedCount,
+      updated: updatedCount,
+      deleted: deletedCount,
       attachments: result.attachments.length,
       errors: result.errors.length,
       ...(result.errors.length > 0 ? { errorSummary } : {}),
     },
-    `sync complete — written: ${result.written.length}, attachments: ${result.attachments.length}, errors: ${result.errors.length}` +
-      (result.errors.length > 0
-        ? ` (${Object.entries(errorSummary).map(([k, v]) => `${k}=${v}`).join(', ')}). Re-run \`npm start\` to retry the failed pages — state is per-page, so successful ones are skipped.`
-        : ''),
+    headline,
   );
 }
 
@@ -212,7 +258,6 @@ async function runBench(): Promise<void> {
   const client = new ConfluenceClient({
     baseUrl: config.confluence.base_url,
     pat: config.confluence.pat,
-    verifyTls: config.confluence.verify_tls,
   });
 
   // Collect a sample of page ids from the first watch scope. We stop after

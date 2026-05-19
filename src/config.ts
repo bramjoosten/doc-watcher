@@ -13,7 +13,6 @@ export const configSchema = z.object({
   confluence: z.object({
     base_url: z.string().url(),
     pat: z.string().min(1, 'pat is required in confluence: — paste your Confluence PAT here'),
-    verify_tls: z.boolean().default(true),
   }),
   paths: z
     .object({

@@ -3,7 +3,6 @@ import { log } from './log.js';
 export interface ConfluenceClientOptions {
   baseUrl: string;
   pat: string;
-  verifyTls?: boolean;
 }
 
 export interface PageVersion {
@@ -59,9 +58,6 @@ export class ConfluenceClient {
   constructor(opts: ConfluenceClientOptions) {
     this.baseUrl = opts.baseUrl.replace(/\/$/, '');
     this.pat = opts.pat;
-    if (opts.verifyTls === false) {
-      process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
-    }
   }
 
   // Parse a Retry-After header. Confluence returns either a seconds count or
