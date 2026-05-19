@@ -51,7 +51,7 @@ doc-watcher/
 ├── .env.example                    # CONFLUENCE_PAT=...
 ├── .gitignore                      # ignores config.toml, .env, docs/, .claude/, node_modules/
 └── src/
-    ├── cli.ts                      # entry point: init / sync / refresh / reconvert / poll
+    ├── taskmanager.ts              # entry point: init / sync / refresh / reconvert / poll
     ├── config.ts                   # zod schema, TOML loader
     ├── confluence.ts               # REST client (typed wrappers around fetch)
     ├── walker.ts                   # expand watch scopes → page id list (CQL)

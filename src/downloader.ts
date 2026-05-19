@@ -10,8 +10,8 @@ import {
   attachmentPath,
   attachmentRelativeForPage,
   folderIndexPath,
+  htmlPathFor,
   leafPath,
-  pageBaseName,
   spaceIndexPath,
 } from './pathing.js';
 import type { PageState, StateFile } from './state.js';
@@ -35,31 +35,18 @@ export interface DownloadResult {
   errors: { id: string; error: unknown }[];
 }
 
-function frontmatter(values: Record<string, unknown>): string {
-  const lines = ['---'];
-  for (const [k, v] of Object.entries(values)) {
-    if (Array.isArray(v)) {
-      const arr = v.map((x) => JSON.stringify(x)).join(', ');
-      lines.push(`${k}: [${arr}]`);
-    } else if (v === null || v === undefined) {
-      lines.push(`${k}: null`);
-    } else if (typeof v === 'number' || typeof v === 'boolean') {
-      lines.push(`${k}: ${v}`);
-    } else {
-      lines.push(`${k}: ${JSON.stringify(String(v))}`);
-    }
-  }
-  lines.push('---', '');
-  return lines.join('\n');
+// Canonical source-URL for a Confluence page. We always use the /pages/viewpage.action
+// form (rather than page._links.webui) so the URL is deterministic — sync and reconvert
+// produce identical .md headers.
+export function sourceUrlFor(baseUrl: string, pageId: string): string {
+  return `${baseUrl.replace(/\/$/, '')}/pages/viewpage.action?pageId=${pageId}`;
 }
 
-function buildPageUrl(baseUrl: string, page: ConfluencePage): string {
-  const trimmed = baseUrl.replace(/\/$/, '');
-  const webui = page._links?.webui;
-  if (webui) {
-    return webui.startsWith('http') ? webui : `${trimmed}${webui.startsWith('/') ? '' : '/'}${webui}`;
-  }
-  return `${trimmed}/pages/viewpage.action?pageId=${page.id}`;
+// Build the body of the .md file: a one-line markdown autolink to the Confluence
+// source, then the title as an H1, then the converted body. No frontmatter — all
+// structural metadata lives in SQLite (state).
+export function buildMarkdownBody(sourceUrl: string, title: string, markdown: string): string {
+  return `<${sourceUrl}>\n\n# ${title}\n\n${markdown}\n`;
 }
 
 function resolveRelativePagePath(pageRelPath: string, targetRelPath: string): string {
@@ -88,6 +75,36 @@ export function pickPageRelPath(
   return leafPath(spaceKey, filteredAncestors, page.title, page.id);
 }
 
+// Shared between fetchAndWriteOne (online sync) and runReconvert (offline rebuild).
+// Both need the same resolver behaviour so a sync and a subsequent reconvert produce
+// byte-identical .md files.
+export function buildConvertOptions(args: {
+  pageId: string;
+  pagePath: string;
+  pageSpace: string;
+  baseUrl: string;
+  state: StateFile;
+  knownPagePaths: Map<string, string>;
+  titleIndex: Map<string, string>;
+}): Parameters<typeof convertStorageFormat>[1] {
+  const { pageId, pagePath, pageSpace, baseUrl, state, knownPagePaths, titleIndex } = args;
+  return {
+    pageId,
+    resolveImage: (filename: string) => attachmentRelativeForPage(pagePath, pageSpace, pageId, filename),
+    resolvePageLink: (ref) => {
+      const targetSpace = ref.spaceKey ?? pageSpace;
+      const targetId = titleIndex.get(titleIndexKey(targetSpace, ref.contentTitle));
+      if (targetId) {
+        const targetPath = knownPagePaths.get(targetId) ?? state.pages[targetId]?.path;
+        if (targetPath) return resolveRelativePagePath(pagePath, targetPath);
+      }
+      const base = baseUrl.replace(/\/$/, '');
+      const titleEnc = encodeURIComponent(ref.contentTitle.replace(/\s+/g, '+'));
+      return `${base}/display/${encodeURIComponent(targetSpace)}/${titleEnc}`;
+    },
+  };
+}
+
 async function fetchAndWriteOne(
   page: ConfluencePage,
   opts: DownloadOptions,
@@ -106,23 +123,18 @@ async function fetchAndWriteOne(
   for (const a of attachments) attachmentByName.set(a.title, a);
 
   const html = page.body?.storage?.value ?? '';
-  const conversion = convertStorageFormat(html, {
-    pageId: page.id,
-    resolveImage: (filename) => attachmentRelativeForPage(relPath, spaceKey, page.id, filename),
-    resolvePageLink: (ref) => {
-      // 1. Title→id map hit → relative local path.
-      const targetSpace = ref.spaceKey ?? spaceKey;
-      const targetId = opts.titleIndex.get(titleIndexKey(targetSpace, ref.contentTitle));
-      if (targetId) {
-        const targetPath = opts.knownPagePaths.get(targetId) ?? opts.state.pages[targetId]?.path;
-        if (targetPath) return resolveRelativePagePath(relPath, targetPath);
-      }
-      // 2/3. Out of scope (cross-space or title not found) → absolute Confluence URL.
-      const base = opts.config.confluence.base_url.replace(/\/$/, '');
-      const titleEnc = encodeURIComponent(ref.contentTitle.replace(/\s+/g, '+'));
-      return `${base}/display/${encodeURIComponent(targetSpace)}/${titleEnc}`;
-    },
-  });
+  const conversion = convertStorageFormat(
+    html,
+    buildConvertOptions({
+      pageId: page.id,
+      pagePath: relPath,
+      pageSpace: spaceKey,
+      baseUrl: opts.config.confluence.base_url,
+      state: opts.state,
+      knownPagePaths: opts.knownPagePaths,
+      titleIndex: opts.titleIndex,
+    }),
+  );
 
   if (wantAttachments) {
     await Promise.all(
@@ -146,20 +158,18 @@ async function fetchAndWriteOne(
     );
   }
 
-  const fm = frontmatter({
-    confluence_id: page.id,
-    confluence_url: buildPageUrl(opts.config.confluence.base_url, page),
-    space: spaceKey,
-    title: page.title,
-    version: page.version?.number ?? 0,
-    last_modified: page.version?.when ?? null,
-    ancestors: (page.ancestors ?? []).map((a) => a.id),
-    sync_time: syncIso,
-  });
+  // Write the raw storage-format HTML next to the .md so reconvert can rebuild the
+  // markdown later without re-hitting Confluence.
+  const htmlAbsPath = htmlPathFor(absPath);
+  const sourceUrl = sourceUrlFor(opts.config.confluence.base_url, page.id);
+  const mdBody = buildMarkdownBody(sourceUrl, page.title, conversion.markdown);
 
-  const body = `${fm}# ${page.title}\n\n${conversion.markdown}\n`;
   await mkdir(dirname(absPath), { recursive: true });
-  await writeFile(absPath, body, 'utf8');
+  await writeFile(htmlAbsPath, html, 'utf8');
+  await writeFile(absPath, mdBody, 'utf8');
+
+  // Quiet "unused" hint — syncIso is part of the public signature for future fields.
+  void syncIso;
 
   return { relPath, attachments: attachmentRefs };
 }
