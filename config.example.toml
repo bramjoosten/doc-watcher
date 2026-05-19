@@ -9,7 +9,14 @@ state_dir  = "./.state"
 cache_html = false
 
 [sync]
+# parallel_downloads is autotuned: on first run (or whenever this key is missing),
+# doc-watcher runs a short benchmark to find the value that downloads fastest
+# without tripping errors on your network + server combo, and writes the result
+# back here. To re-trigger the benchmark, delete the key (or its value). To pin
+# a specific value, just edit it — the bench won't overwrite a hand-set value
+# during normal startup. Run `npm start -- bench` to force a re-benchmark.
 parallel_downloads    = 10
+
 include_attachments   = true
 poll_interval_seconds = 600
 

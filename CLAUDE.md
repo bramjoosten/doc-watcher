@@ -111,11 +111,32 @@ Always deterministic, always replayable. The `.html` file on disk is what the co
 
 ### Core flows
 
-- **`sync`** (default, incremental): build CQL with `lastmodified` lower bound, page through results, diff against SQLite, fetch changed pages in parallel via `p-limit`, write both `.html` and `.md`, atomic file replace, commit SQLite transaction.
+**`npm start`** is the daily driver: it runs an initial `sync` (full enumeration if state is empty, incremental otherwise), then enters the polling loop. The first run does the bulk download; everything after is cheap deltas. This is the "set it and forget it" mode.
+
+Verbs available when you want a one-shot operation instead:
+
+- **`sync`** (incremental): build CQL with `lastmodified` lower bound, page through results, diff against SQLite, fetch changed pages in parallel, write both `.html` and `.md`, atomic file replace, commit SQLite transaction.
 - **`refresh`**: same as `sync` but ignores `last_sync` (full re-download).
 - **`reconvert`**: walk every `.html` already on disk and regenerate the `.md` next to it. No network calls. Used after a converter change.
 - **`poll`**: `while (true) { await sync(); await sleep(poll_interval); }`. Once-per-day full enumeration is built in so deletes get caught.
+- **`bench`**: re-run the concurrency autotune (see below) and persist the result.
 - **`init`**: copy `config.example.toml` → `config.toml`, create `.env` template, scaffold dirs.
+
+### Concurrency autotune
+
+The first run is the one that hurts. A space can hold thousands of pages, and the right tuning depends on the network, the server's load, the CPU, and what else is on the machine — there's no universal number that's right. Too low and the initial sync drags; too high and we either saturate the link or trip Confluence's rate limit.
+
+So before the first real `sync`, doc-watcher runs a short empirical benchmark. It sweeps the relevant levers — download concurrency primarily, processing parallelism if it turns out to matter — over a small grid of values, measures elapsed time and error rate at each point, and picks the combination that gave the best throughput without errors. The chosen values get written back into `config.toml` under `[sync]`, alongside any other settings.
+
+After that, every run just reads the values from `config.toml`. The bench doesn't run again unless one of three things happens:
+
+- The relevant value is **missing** from `config.toml` — treated as "re-bench, decide for me." This is also how the user opts back in: delete the value, next run benches.
+- The user **manually edits** the value — left alone, treated as user intent. The bench won't overwrite a non-empty value during normal startup.
+- The user runs **`npm start -- bench`** explicitly — always re-benches and overwrites, regardless of current values.
+
+There's also a fallback heuristic (`min(50, max(4, cpu_cores * 2))`) for the awkward case where the bench is somehow skipped *and* no value exists in config — but in practice, missing-means-bench keeps this from triggering.
+
+The bench is worth running again when conditions change — moving to a slower link, the Confluence server getting upgraded, etc.
 
 ## Out of scope (for now)
 
