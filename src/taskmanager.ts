@@ -23,7 +23,10 @@ import { emptyState, readState, writeState } from './state.js';
 import { planScopes } from './walker.js';
 
 const BENCH_SAMPLE_SIZE = 30;
-const BENCH_CONCURRENCY_LEVELS = [1, 2, 5, 10, 20, 50];
+// Dropped 50 — even when bench's 30-request burst tolerates it, sustained
+// load over thousands of pages drains the server's token bucket and the
+// real sync hits cascading 429s.
+const BENCH_CONCURRENCY_LEVELS = [1, 2, 5, 10, 20];
 
 const FULL_ENUMERATION_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
@@ -363,13 +366,14 @@ async function runBench(): Promise<void> {
     return;
   }
   const peak = candidates.reduce((a, b) => (b.throughputPerSec > a.throughputPerSec ? b : a));
-  // Step one tier down from the peak for headroom. Bench measures *burst*
+  // Step TWO tiers down from the peak for headroom. Bench measures *burst*
   // tolerance on 30 pages; a full sync sustains the load over thousands of
   // pages, and the server's token bucket only drains under sustained
-  // pressure. Picking the next tier down trades a slice of peak throughput
-  // for a much lower chance of cascading 429s mid-run.
+  // pressure. One tier proved too aggressive in practice (cascading 429
+  // storms mid-sync); two tiers trades more throughput for much higher
+  // reliability. Users who need speed can pin a higher value manually.
   const peakIdx = BENCH_CONCURRENCY_LEVELS.indexOf(peak.concurrency);
-  const safeIdx = Math.max(0, peakIdx - 1);
+  const safeIdx = Math.max(0, peakIdx - 2);
   const safeLevel = BENCH_CONCURRENCY_LEVELS[safeIdx]!;
   const best = candidates.find((r) => r.concurrency === safeLevel) ?? peak;
   log.info(
@@ -379,7 +383,7 @@ async function runBench(): Promise<void> {
       chosenConcurrency: best.concurrency,
     },
     `bench: peak was parallel_downloads = ${peak.concurrency} (${peak.throughputPerSec} pages/s); ` +
-      `picking ${best.concurrency} one tier down for sustained-load headroom`,
+      `picking ${best.concurrency} (two tiers down) for sustained-load headroom`,
   );
 
   // Match any existing line — commented or not — preserving leading indentation
