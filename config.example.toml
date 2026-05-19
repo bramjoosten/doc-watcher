@@ -1,0 +1,22 @@
+[confluence]
+base_url = "https://confluence.example.com"
+pat_env = "CONFLUENCE_PAT"
+verify_tls = true
+
+[paths]
+output_dir = "./docs"
+state_dir  = "./.state"
+cache_html = false
+
+[sync]
+parallel_downloads    = 10
+include_attachments   = true
+poll_interval_seconds = 600
+
+[[watch]]
+type = "space"
+key  = "ENG"
+
+[[watch]]
+type         = "tree"
+root_page_id = "123456"
