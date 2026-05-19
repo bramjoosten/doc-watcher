@@ -178,7 +178,20 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
     state.last_full_enumeration = syncIso;
   }
 
-  state.last_sync = syncIso;
+  // Only advance last_sync on a fully successful run. If any page failed,
+  // keep last_sync where it was so the next CQL window still includes the
+  // failed pages — their missing state.pages entries will pull them back
+  // into toFetch via the version diff. Successful pages have matching
+  // versions in state and are skipped, so the cost is just re-running the
+  // CQL search, not re-downloading completed pages.
+  if (result.errors.length === 0) {
+    state.last_sync = syncIso;
+  } else {
+    log.warn(
+      { errors: result.errors.length, lastSyncFrozen: state.last_sync ?? '(none)' },
+      `last_sync NOT advanced because ${result.errors.length} page(s) failed; they'll be retried on the next run`,
+    );
+  }
   await writeState(stateDir, state);
 
   // Count how much of toFetch landed successfully, split by new vs updated.
