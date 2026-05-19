@@ -107,6 +107,8 @@ For a 10k-page space the typical delta per 5-minute window is 0–50 pages — s
 
 Auth: `Authorization: Bearer <pat from config.yaml>` on every request.
 
+TLS certificate verification is disabled process-wide (`NODE_TLS_REJECT_UNAUTHORIZED=0`, set in `src/disable-tls-check.ts` which is imported first). Corporate Confluence instances often sit behind private CAs that Node doesn't trust out of the box; rather than asking every user to wrangle a PEM bundle, doc-watcher just skips cert verification. The deliberate scope: a single-user CLI talking to a Confluence on a network you already trust. The warning Node would otherwise print on every HTTPS connection is filtered out by patching `process.emitWarning`.
+
 ### Converter
 
 Confluence "storage format" is XHTML with `<ac:structured-macro>` extensions. A pre-pass with cheerio rewrites macros to plain HTML, then an in-house walker emits markdown. A registry of macro handlers covers code blocks, callouts (info/warning/note), images and attachments, internal links, iframes/embeds, status badges, task lists, user mentions, and emoticons. Unknown macros become HTML comments — visible but inert. The walker handles the standard HTML tag set (p, h1–h6, ul/ol/li with nesting, strong/em/code, pre+code with language hint, a, img, blockquote with our callout data attribute, GFM tables, hr, br).

@@ -1,4 +1,7 @@
 #!/usr/bin/env -S npx tsx
+// Disable TLS cert verification + silence the resulting warning. Must import
+// FIRST so it runs before any HTTPS connection is made.
+import './disable-tls-check.js';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
