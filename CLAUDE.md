@@ -28,12 +28,15 @@ Node.js, TypeScript, run via `tsx`.
 - `turndown` for HTML → Markdown, with custom rules for Confluence macros.
 - `better-sqlite3` for the local index.
 - `zod` for typed config validation; `smol-toml` for TOML parsing.
-- `commander` for the CLI; `dotenv` for loading `CONFLUENCE_PAT`.
-- `pino` for structured logging; `vitest` for tests.
+- `dotenv` for loading `CONFLUENCE_PAT`.
+
+**Minimize third-party dependencies.** Reach for the Node standard library first; a dep only earns its keep when the alternative would be hundreds of lines of nontrivial code (XHTML parsing, HTML→markdown conversion, SQLite bindings). The CLI is a plain Node entry point using `process.argv` — no `commander` / `yargs` / etc. Logging is `console.log` / `console.error`. No test framework for now.
 
 ### State: SQLite, not frontmatter
 
-The `.md` files have **no YAML frontmatter** — they're plain prose, easier for grep, editors, and LLMs to consume. All structural metadata (Confluence ID, version, source URL, ancestors, last-modified, ancestors, links, embeds) lives in `docs/index.sqlite`, with one row per page keyed by Confluence ID. The SQLite file is the source of truth for change detection and link resolution; the on-disk tree is the human-facing view derived from it.
+The `.md` files have **no YAML frontmatter** — they're plain prose, easier for grep, editors, and LLMs to consume. All structural metadata (Confluence ID, version, ancestors, last-modified, links, embeds) lives in `docs/index.sqlite`, with one row per page keyed by Confluence ID. The SQLite file is the source of truth for change detection and link resolution; the on-disk tree is the human-facing view derived from it.
+
+**Source-URL header.** The first line of every converted `.md` is a markdown autolink to the Confluence source page, e.g. `<https://confluence.example.com/pages/viewpage.action?pageId=12345>`. It renders as a clickable link in any markdown viewer, keeps the file traceable when SQLite isn't at hand, and is regenerated from the database during `reconvert`. Beyond this single line the body is unadorned markdown.
 
 ### File layout
 
@@ -48,7 +51,7 @@ doc-watcher/
 ├── .env.example                    # CONFLUENCE_PAT=...
 ├── .gitignore                      # ignores config.toml, .env, docs/, .claude/, node_modules/
 └── src/
-    ├── cli.ts                      # commander entry: init / sync / refresh / poll
+    ├── cli.ts                      # entry point: init / sync / refresh / reconvert / poll
     ├── config.ts                   # zod schema, TOML loader
     ├── confluence.ts               # REST client (typed wrappers around fetch)
     ├── walker.ts                   # expand watch scopes → page id list (CQL)
@@ -117,5 +120,5 @@ Always deterministic, always replayable. The `.html` file on disk is what the co
 ## Out of scope (for now)
 
 - Webhooks. Confluence Server webhooks need admin-level configuration; we only have a user PAT. CQL polling is enough.
-- Adapter abstractions for multiple sources (Notion, Confluence Cloud, etc.). Tracked in `.claude/plans/future-work.md` — left as a one-source codebase until a second source actually exists.
+- Adapter abstractions for multiple sources (Notion, Confluence Cloud, etc.). Left as a one-source codebase until a second source actually exists.
 - Write-back and conflict handling. See nice-to-haves above.
