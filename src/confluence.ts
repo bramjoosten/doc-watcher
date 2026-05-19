@@ -149,10 +149,20 @@ export class ConfluenceClient {
     if (expand.length) params.set('expand', expand.join(','));
     const path = `/rest/api/content/search?${params.toString()}`;
     const out: ConfluencePage[] = [];
+    log.info({ cql }, 'enumerating pages from Confluence — this can take a while for large scopes');
+    const started = Date.now();
     for await (const item of this.paginate<ConfluencePage>(path)) {
       out.push(item);
+      // Pagination batches are 100 (limit param). Log every batch so the user
+      // sees progress instead of a silent hang.
+      if (out.length % 100 === 0) {
+        log.info({ enumerated: out.length, elapsedMs: Date.now() - started }, `enumerated ${out.length} pages so far`);
+      }
     }
-    log.debug({ cql, count: out.length }, 'cql search');
+    log.info(
+      { cql, total: out.length, elapsedMs: Date.now() - started },
+      `enumeration done: ${out.length} pages in ${Date.now() - started}ms`,
+    );
     return out;
   }
 

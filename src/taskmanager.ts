@@ -54,6 +54,12 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
   await mkdir(stateDir, { recursive: true });
 
   const state = opts.full ? emptyState() : await readState(stateDir);
+  const localCount = Object.keys(state.pages).length;
+  log.info(
+    { localCount, lastSync: state.last_sync ?? '(none)', full: opts.full },
+    `state loaded — ${localCount} pages already on disk; last_sync=${state.last_sync ?? '(none)'}`,
+  );
+
   const client = new ConfluenceClient({
     baseUrl: config.confluence.base_url,
     pat: config.confluence.pat,
