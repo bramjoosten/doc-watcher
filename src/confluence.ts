@@ -54,6 +54,12 @@ interface ConfluenceListResponse<T> {
 export class ConfluenceClient {
   private readonly baseUrl: string;
   private readonly pat: string;
+  // Client-wide cooldown. When any request gets a 429/503 with Retry-After,
+  // we set this to (now + waitMs). Every *other* in-flight request checks
+  // this before firing and waits out the cooldown. Without it, parallel
+  // requests retry independently and pile onto the rate-limited server,
+  // turning a single 429 into a cascading storm.
+  private throttledUntilMs = 0;
 
   constructor(opts: ConfluenceClientOptions) {
     this.baseUrl = opts.baseUrl.replace(/\/$/, '');
@@ -80,14 +86,22 @@ export class ConfluenceClient {
   private async fetchWithRetry(url: string, init: RequestInit): Promise<Response> {
     let attempt = 0;
     while (true) {
+      // Honour any client-wide cooldown that a sibling request set.
+      const now = Date.now();
+      if (now < this.throttledUntilMs) {
+        await new Promise<void>((r) => setTimeout(r, this.throttledUntilMs - now));
+      }
       const res = await fetch(url, init);
       if (res.status !== 429 && res.status !== 503) return res;
       if (attempt >= 8) return res;
       const retryAfter = this.parseRetryAfter(res.headers.get('Retry-After'));
       const waitMs = retryAfter ?? Math.min(60_000, 1000 * 2 ** attempt);
+      // Tell every other in-flight request to pause for the same window so
+      // we don't pile retries on a rate-limited server.
+      this.throttledUntilMs = Math.max(this.throttledUntilMs, Date.now() + waitMs);
       log.warn(
         { status: res.status, url, attempt: attempt + 1, waitMs },
-        `rate limited; backing off`,
+        `rate limited; backing off (client-wide cooldown ${waitMs}ms)`,
       );
       // Drain the body so the connection can be reused.
       await res.text().catch(() => '');
