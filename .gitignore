@@ -1,6 +1,5 @@
 node_modules/
-config.toml
-.env
+config.yaml
 docs/
 .state/
 .cache/

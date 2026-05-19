@@ -1,0 +1,40 @@
+confluence:
+  base_url: https://confluence.example.com
+
+  # Confluence Server/DC Personal Access Token (Bearer auth).
+  # Create one at: <your-confluence>/plugins/personalaccesstokens/usertokens.action
+  # (or: profile picture → Settings → Personal Access Tokens → Create token).
+  # The token is shown only once on creation — paste it here before closing the dialog.
+  pat: ""
+
+  verify_tls: true
+
+paths:
+  output_dir: ./docs
+  state_dir: ./.state
+  cache_html: false
+
+sync:
+  # parallel_downloads is the number of concurrent page fetches.
+  # Comment this line out (or delete it) to force an autotune on the next run —
+  # doc-watcher will benchmark a few values, pick the fastest one that doesn't
+  # trip rate limits, and write the result back here. Otherwise just set a
+  # reasonable number (10 is a safe starting point on most networks).
+  parallel_downloads: 10
+
+  # Inline images referenced via ac:image macros. Set to true once you've gauged
+  # bandwidth on a small first sync — a space with diagrams can easily push tens of GB.
+  # Non-inline file attachments (PDFs, decks, etc.) are not mirrored either way.
+  include_attachments: false
+
+  # Only used by the opt-in poll mode (`npm start -- poll`), which loops sync
+  # forever at this cadence. The default `npm start` is one-shot — run it again
+  # whenever you want fresh docs.
+  poll_interval_seconds: 600
+
+# Each watch entry mirrors one Confluence page subtree (the root page plus
+# everything beneath it, any depth). Add more entries to mirror additional
+# roots. Find the page id in the URL (?pageId=NNNNN); if you only see the
+# pretty /display/SPACE/Title form, click Edit and the id shows up.
+watch:
+  - root_page_id: "123456"

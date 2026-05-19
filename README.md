@@ -1,6 +1,6 @@
 # doc-watcher
 
-Mirror a Confluence Server (DC 7.9+) tree to local files — the raw HTML (the durable source of truth) plus a clean Markdown view next to it for `rg`, editors, and local AI. PAT-authenticated, walks one or more configured scopes (a whole space, or a page subtree by root id), incrementally re-syncs only changed pages.
+Mirror a Confluence Server (DC 7.9+) tree to local files — the raw HTML (the durable source of truth) plus a clean Markdown view next to it for `rg`, editors, and local AI. PAT-authenticated, walks one or more configured page subtrees, incrementally re-syncs only changed pages.
 
 Webhooks are out of scope (they need Confluence admin access; we only assume a user-level PAT). Change detection is CQL polling on `lastmodified`.
 
@@ -10,10 +10,15 @@ Webhooks are out of scope (they need Confluence admin access; we only assume a u
 git clone https://code.bramjoosten.nl/bram/doc-watcher.git
 cd doc-watcher
 npm install
-npm start -- init
+cp config.example.yaml config.yaml
 ```
 
-`init` writes `config.toml` and `.env` from the example templates and scaffolds the working dirs. Edit `config.toml` to set `base_url` and add your `[[watch]]` scopes, then put your token in `.env` (see `.env.example` for how to create the PAT).
+Open `config.yaml` and fill in:
+- `confluence.base_url` — your Confluence root URL.
+- `confluence.pat` — your Personal Access Token (creation steps are in the comment above the field).
+- `watch[].root_page_id` — at least one page id to mirror (the root and everything beneath it).
+
+`config.yaml` is gitignored; the example file stays clean.
 
 ## Run
 
@@ -23,19 +28,18 @@ npm start
 
 That's the daily-driver. With no args it runs an **incremental sync** — the first invocation does the bulk download (state is empty), every subsequent run only fetches pages that changed since the last sync. Then it exits. Run it again whenever you want fresh docs.
 
-The very first run also benchmarks download concurrency on a sample of pages and writes the chosen value into `config.toml` under `[sync]`, so future runs reuse it. Delete that key to re-bench; edit it by hand to pin a specific value.
+The very first run also benchmarks download concurrency on a sample of pages and writes the chosen value into `config.yaml` under `sync.parallel_downloads`, so future runs reuse it. Comment out (or delete) that line to force a re-bench; edit it by hand to pin a specific value.
 
-There's an opt-in `poll` mode (`npm start -- poll`) that loops sync forever, but it's not the default — `doc-watcher` is read-only for now, so there's no urgency to be live.
+There's an opt-in `poll` mode (`npm start -- poll`) that loops sync forever, but it's not the default — doc-watcher is read-only for now, so there's no urgency to be live.
 
 ## One-shot verbs
 
-For manual operations instead of leaving the watcher running:
+For manual operations instead of leaving the default sync flow:
 
 - `npm start -- sync` — one incremental sync, then exit.
 - `npm start -- refresh` — full re-download (ignores `last_sync`, reconciles deletes).
 - `npm start -- reconvert` — regenerate every `.md` from the saved `.html`. No network.
-- `npm start -- bench` — re-run the concurrency benchmark, overwrite the stored value.
-- `npm start -- init` — scaffold templates (see Setup).
+- `npm start -- poll` — loop sync forever at the cadence set in `config.yaml`.
 
 ## Output layout
 

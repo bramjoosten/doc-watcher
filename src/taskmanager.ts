@@ -1,5 +1,5 @@
 #!/usr/bin/env -S npx tsx
-import { copyFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pLimit } from './limit.js';
@@ -25,7 +25,6 @@ const BENCH_CONCURRENCY_LEVELS = [1, 2, 5, 10, 20, 50];
 const FULL_ENUMERATION_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 function buildFullEnumerationCQL(watch: WatchEntry): string {
-  if (watch.type === 'space') return `space = "${watch.key}" AND type = page`;
   return `(id = ${watch.root_page_id} OR ancestor = ${watch.root_page_id}) AND type = page`;
 }
 
@@ -38,7 +37,7 @@ async function ensureTuned(): Promise<void> {
     );
     return;
   }
-  log.info('parallel_downloads not set in config.toml — running autotune (one-time)');
+  log.info('parallel_downloads not set in config.yaml — running autotune (one-time)');
   try {
     await runBench();
   } catch (err) {
@@ -48,7 +47,7 @@ async function ensureTuned(): Promise<void> {
 
 async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }): Promise<void> {
   await ensureTuned();
-  const { config, pat, rootDir } = await loadConfig();
+  const { config, rootDir } = await loadConfig();
   const stateDir = resolve(rootDir, config.paths.state_dir);
   const outputDir = resolve(rootDir, config.paths.output_dir);
   await mkdir(outputDir, { recursive: true });
@@ -57,7 +56,7 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
   const state = opts.full ? emptyState() : await readState(stateDir);
   const client = new ConfluenceClient({
     baseUrl: config.confluence.base_url,
-    pat,
+    pat: config.confluence.pat,
     verifyTls: config.confluence.verify_tls,
   });
 
@@ -157,34 +156,8 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
   );
 }
 
-async function runInit(): Promise<void> {
-  const cwd = process.cwd();
-  const configSrc = resolve(cwd, 'config.example.toml');
-  const configDst = resolve(cwd, 'config.toml');
-  const envDst = resolve(cwd, '.env');
-  if (!existsSync(configSrc)) {
-    log.error({ configSrc }, 'config.example.toml not found in cwd; run from project root');
-    process.exitCode = 1;
-    return;
-  }
-  if (existsSync(configDst)) {
-    log.info({ configDst }, 'config.toml already exists; leaving as-is');
-  } else {
-    await copyFile(configSrc, configDst);
-    log.info({ configDst }, 'created config.toml');
-  }
-  if (!existsSync(envDst)) {
-    await writeFile(envDst, 'CONFLUENCE_PAT=\nCONFLUENCE_BASE_URL=\n', 'utf8');
-    log.info({ envDst }, 'created .env');
-  }
-  for (const dir of ['docs', '.state', '.cache']) {
-    await mkdir(resolve(cwd, dir), { recursive: true });
-  }
-  log.info('init complete; fill in .env and edit config.toml, then run sync');
-}
-
 async function runBench(): Promise<void> {
-  const { config, pat, rootDir } = await loadConfig();
+  const { config, rootDir } = await loadConfig();
   const firstScope = config.watch[0];
   if (!firstScope) {
     log.error('no [[watch]] scopes configured; nothing to bench');
@@ -192,16 +165,16 @@ async function runBench(): Promise<void> {
     return;
   }
 
-  const configPath = resolve(rootDir, 'config.toml');
+  const configPath = resolve(rootDir, 'config.yaml');
   if (!existsSync(configPath)) {
-    log.error({ configPath }, 'config.toml not found; run `init` first');
+    log.error({ configPath }, 'config.yaml not found; copy config.example.yaml to config.yaml first');
     process.exitCode = 1;
     return;
   }
 
   const client = new ConfluenceClient({
     baseUrl: config.confluence.base_url,
-    pat,
+    pat: config.confluence.pat,
     verifyTls: config.confluence.verify_tls,
   });
 
@@ -278,28 +251,31 @@ async function runBench(): Promise<void> {
     `bench winner: parallel_downloads = ${best.concurrency}`,
   );
 
-  // Match any existing line — commented or not — so a default config.toml
-  // (which ships with the line commented out) gets activated.
+  // Match any existing line — commented or not — preserving leading indentation
+  // (YAML cares). Falls back to inserting under the `sync:` key.
   const text = await readFile(configPath, 'utf8');
-  const lineRe = /^[ \t]*#?[ \t]*parallel_downloads[ \t]*=[ \t]*\d+[^\n]*$/m;
-  const syncHeaderRe = /^\[sync\][ \t]*$/m;
-  const newLine = `parallel_downloads = ${best.concurrency}`;
+  const lineRe = /^([ \t]*)#?[ \t]*parallel_downloads[ \t]*:[ \t]*\d+[^\n]*$/m;
+  const syncHeaderRe = /^sync:[ \t]*$/m;
 
   let updated: string | null = null;
-  if (lineRe.test(text)) {
-    updated = text.replace(lineRe, newLine);
+  const lineMatch = text.match(lineRe);
+  if (lineMatch) {
+    const indent = lineMatch[1] ?? '  ';
+    updated = text.replace(lineRe, `${indent}parallel_downloads: ${best.concurrency}`);
   } else if (syncHeaderRe.test(text)) {
-    // No existing line at all — insert directly under the [sync] header.
-    updated = text.replace(syncHeaderRe, `[sync]\n${newLine}`);
+    updated = text.replace(syncHeaderRe, `sync:\n  parallel_downloads: ${best.concurrency}`);
   }
 
   if (updated !== null) {
     await writeFile(configPath, updated, 'utf8');
-    log.info({ configPath, value: best.concurrency }, `wrote ${newLine} to config.toml`);
+    log.info(
+      { configPath, value: best.concurrency },
+      `wrote parallel_downloads: ${best.concurrency} to config.yaml`,
+    );
   } else {
     log.warn(
       { value: best.concurrency },
-      `config.toml has no [sync] table; add it manually: [sync]\\n${newLine}`,
+      `config.yaml has no sync: section; add it manually:\nsync:\n  parallel_downloads: ${best.concurrency}`,
     );
   }
 }
@@ -375,8 +351,9 @@ async function runPoll(): Promise<void> {
 }
 
 function usage(): void {
-  console.error('usage: npm start -- <init|sync|refresh|reconvert|bench|poll> [--force-full-enumeration]');
+  console.error('usage: npm start -- <sync|refresh|reconvert|poll> [--force-full-enumeration]');
   console.error('default (no args): sync  (incremental — does the initial download on first run)');
+  console.error('autotune runs automatically when parallel_downloads is unset in config.yaml.');
 }
 
 const [, , cmd, ...rest] = process.argv;
@@ -384,9 +361,6 @@ const forceFullEnumeration = rest.includes('--force-full-enumeration');
 
 (async () => {
   switch (cmd ?? 'sync') {
-    case 'init':
-      await runInit();
-      break;
     case 'sync':
       await runSync({ full: false, forceFullEnumeration });
       break;
@@ -395,9 +369,6 @@ const forceFullEnumeration = rest.includes('--force-full-enumeration');
       break;
     case 'reconvert':
       await runReconvert();
-      break;
-    case 'bench':
-      await runBench();
       break;
     case 'poll':
       await runPoll();

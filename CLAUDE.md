@@ -26,8 +26,8 @@ Node.js, TypeScript, run via `tsx`.
 - Built-in `fetch` (undici); a 15-line inline `pLimit` helper for bounded-concurrency parallel downloads.
 - `cheerio` for parsing Confluence storage-format XHTML.
 - In-house HTML→Markdown walker in `converter.ts` (no `turndown` — DOM-lib transitive deps kept tripping corp security scanners).
-- `zod` for typed config validation; `smol-toml` for TOML parsing.
-- `.env` loaded via Node's built-in `--env-file-if-exists` flag — no `dotenv` dep.
+- `zod` for typed config validation; `yaml` for YAML parsing.
+- Credentials live in `config.yaml` directly — no `.env` file, no env-var indirection.
 
 **Minimize third-party dependencies.** Reach for the Node standard library first; a dep only earns its keep when the alternative would be hundreds of lines of nontrivial code (XHTML parsing, HTML→markdown conversion). **No native modules** — the tool has to install on locked-down corporate machines where the npm proxy MITMs TLS and prebuilt binaries fail to download. Pure JavaScript across the board. The CLI is a plain Node entry point using `process.argv` — no `commander` / `yargs` / etc. Logging is `console.log` / `console.error`. No test framework for now.
 
@@ -47,13 +47,12 @@ doc-watcher/
 ├── package.json
 ├── tsconfig.json
 ├── README.md
-├── config.example.toml
-├── config.toml                     # gitignored
-├── .env.example                    # CONFLUENCE_PAT=...
-├── .gitignore                      # ignores config.toml, .env, docs/, .claude/, node_modules/
+├── config.example.yaml
+├── config.yaml                     # gitignored — base_url, pat, watch roots, etc.
+├── .gitignore                      # ignores config.yaml, docs/, .state/, .claude/, node_modules/
 └── src/
-    ├── taskmanager.ts              # entry point: init / sync / refresh / reconvert / poll
-    ├── config.ts                   # zod schema, TOML loader
+    ├── taskmanager.ts              # entry point: sync / refresh / reconvert / poll
+    ├── config.ts                   # zod schema, YAML loader
     ├── confluence.ts               # REST client (typed wrappers around fetch)
     ├── walker.ts                   # expand watch scopes → page id list (CQL)
     ├── downloader.ts               # parallel fetch + write, p-limit-bounded
@@ -104,7 +103,7 @@ For a 10k-page space the typical delta per 5-minute window is 0–50 pages — s
 - `GET /rest/api/content/{id}/child/attachment?expand=version` — attachment list.
 - `GET /download/attachments/{pageId}/{filename}` — binary download.
 
-Auth: `Authorization: Bearer $CONFLUENCE_PAT` on every request.
+Auth: `Authorization: Bearer <pat from config.yaml>` on every request.
 
 ### Converter
 
@@ -114,32 +113,30 @@ Always deterministic, always replayable. The `.html` file on disk is what the co
 
 ### Core flows
 
-**`npm start`** is the daily driver. With no args it runs `sync`: incremental if state exists, full enumeration if it doesn't (so the first invocation does the bulk download). It also triggers `bench` automatically if `parallel_downloads` is unset in `config.toml`. Run it again whenever you want fresh docs — subsequent runs only fetch what changed.
+**`npm start`** is the daily driver. With no args it runs `sync`: incremental if state exists, full enumeration if it doesn't (so the first invocation does the bulk download). It also triggers an autotune automatically if `parallel_downloads` is unset in `config.yaml`. Run it again whenever you want fresh docs — subsequent runs only fetch what changed.
 
 Verbs:
 
 - **`sync`** (default): autotune if needed → build CQL with `lastmodified` lower bound, page through results, diff against state, fetch changed pages in parallel, write both `.html` and `.md`, atomic state-file replace at the end.
 - **`refresh`**: same as `sync` but ignores `last_sync` (full re-download).
 - **`reconvert`**: walk every `.html` already on disk and regenerate the `.md` next to it. No network calls. Used after a converter change.
-- **`bench`**: re-run the concurrency autotune (see below) and persist the result.
 - **`poll`**: `while (true) { await sync(); await sleep(poll_interval); }`. Opt-in long-running mode — not the default. Doc-watcher is read-only for now, so there's no urgency to be live; the `poll` shape becomes more useful once write-back ships.
-- **`init`**: copy `config.example.toml` → `config.toml`, create `.env` template, scaffold dirs.
+
+Setup is manual: copy `config.example.yaml` → `config.yaml` and fill in the placeholders (`base_url`, `pat`, `watch[].root_page_id`). No `init` verb — fewer moving parts.
+
+There is no explicit `bench` verb. The autotune is internal — triggered only when `parallel_downloads` is missing from `config.yaml`. To force a re-bench, comment out (or delete) the value in `config.yaml` and run `npm start` again.
 
 ### Concurrency autotune
 
 The first run is the one that hurts. A space can hold thousands of pages, and the right tuning depends on the network, the server's load, the CPU, and what else is on the machine — there's no universal number that's right. Too low and the initial sync drags; too high and we either saturate the link or trip Confluence's rate limit.
 
-So before the first real `sync`, doc-watcher runs a short empirical benchmark. It sweeps the relevant levers — download concurrency primarily, processing parallelism if it turns out to matter — over a small grid of values, measures elapsed time and error rate at each point, and picks the combination that gave the best throughput without errors. The chosen values get written back into `config.toml` under `[sync]`, alongside any other settings.
+So before the first real `sync`, doc-watcher runs a short empirical benchmark. It sweeps the relevant levers — download concurrency primarily, processing parallelism if it turns out to matter — over a small grid of values, measures elapsed time and error rate at each point, and picks the combination that gave the best throughput without errors. The chosen values get written back into `config.yaml` under `[sync]`, alongside any other settings.
 
-After that, every run just reads the values from `config.toml`. The bench doesn't run again unless one of three things happens:
-
-- The relevant value is **missing** from `config.toml` — treated as "re-bench, decide for me." This is also how the user opts back in: delete the value, next run benches.
-- The user **manually edits** the value — left alone, treated as user intent. The bench won't overwrite a non-empty value during normal startup.
-- The user runs **`npm start -- bench`** explicitly — always re-benches and overwrites, regardless of current values.
+After that, every run just reads the value from `config.yaml`. The bench only runs again when **`parallel_downloads` is missing** (commented out or absent) — that's the sole trigger. Editing the value by hand pins it; the bench won't overwrite a hand-set value.
 
 There's also a fallback heuristic (`min(50, max(4, cpu_cores * 2))`) for the awkward case where the bench is somehow skipped *and* no value exists in config — but in practice, missing-means-bench keeps this from triggering.
 
-The bench is worth running again when conditions change — moving to a slower link, the Confluence server getting upgraded, etc.
+Re-bench when conditions change (slower link, server upgrade, etc.) by commenting out the value in `config.yaml` and running `npm start` again.
 
 ## Out of scope (for now)
 
