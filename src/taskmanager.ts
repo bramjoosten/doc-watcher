@@ -31,7 +31,13 @@ function buildFullEnumerationCQL(watch: WatchEntry): string {
 
 async function ensureTuned(): Promise<void> {
   const { config } = await loadConfig();
-  if (config.sync.parallel_downloads && config.sync.parallel_downloads > 0) return;
+  if (config.sync.parallel_downloads && config.sync.parallel_downloads > 0) {
+    log.info(
+      { parallel_downloads: config.sync.parallel_downloads },
+      `using configured parallel_downloads = ${config.sync.parallel_downloads}; skipping autotune`,
+    );
+    return;
+  }
   log.info('parallel_downloads not set in config.toml — running autotune (one-time)');
   try {
     await runBench();
@@ -247,8 +253,13 @@ async function runBench(): Promise<void> {
     );
     const elapsedMs = Date.now() - start;
     const throughputPerSec = sample.length / (elapsedMs / 1000);
-    results.push({ concurrency: c, elapsedMs, errors, throughputPerSec: Number(throughputPerSec.toFixed(2)) });
-    log.info({ concurrency: c, elapsedMs, errors, throughputPerSec: throughputPerSec.toFixed(2) }, 'bench level done');
+    const rounded = Number(throughputPerSec.toFixed(2));
+    results.push({ concurrency: c, elapsedMs, errors, throughputPerSec: rounded });
+    log.info(
+      { concurrency: c, elapsedMs, errors, throughputPerSec: rounded },
+      `bench level done — parallel_downloads = ${c} → ${rounded} pages/s` +
+        (errors > 0 ? ` (${errors} error(s))` : ''),
+    );
     if (errors > 0) {
       log.warn({ concurrency: c, errors }, 'errors at this level; stopping sweep');
       break;
@@ -262,15 +273,34 @@ async function runBench(): Promise<void> {
     return;
   }
   const best = candidates.reduce((a, b) => (b.throughputPerSec > a.throughputPerSec ? b : a));
-  log.info({ best: best.concurrency, throughputPerSec: best.throughputPerSec }, 'bench winner');
+  log.info(
+    { winningConcurrency: best.concurrency, throughputPerSec: best.throughputPerSec },
+    `bench winner: parallel_downloads = ${best.concurrency}`,
+  );
 
+  // Match any existing line — commented or not — so a default config.toml
+  // (which ships with the line commented out) gets activated.
   const text = await readFile(configPath, 'utf8');
-  if (/^\s*parallel_downloads\s*=\s*\d+/m.test(text)) {
-    const updated = text.replace(/^(\s*parallel_downloads\s*=\s*)\d+/m, `$1${best.concurrency}`);
+  const lineRe = /^[ \t]*#?[ \t]*parallel_downloads[ \t]*=[ \t]*\d+[^\n]*$/m;
+  const syncHeaderRe = /^\[sync\][ \t]*$/m;
+  const newLine = `parallel_downloads = ${best.concurrency}`;
+
+  let updated: string | null = null;
+  if (lineRe.test(text)) {
+    updated = text.replace(lineRe, newLine);
+  } else if (syncHeaderRe.test(text)) {
+    // No existing line at all — insert directly under the [sync] header.
+    updated = text.replace(syncHeaderRe, `[sync]\n${newLine}`);
+  }
+
+  if (updated !== null) {
     await writeFile(configPath, updated, 'utf8');
-    log.info({ configPath, value: best.concurrency }, 'wrote parallel_downloads to config.toml');
+    log.info({ configPath, value: best.concurrency }, `wrote ${newLine} to config.toml`);
   } else {
-    log.warn({ value: best.concurrency }, 'config.toml has no parallel_downloads line under [sync]; add it manually to persist');
+    log.warn(
+      { value: best.concurrency },
+      `config.toml has no [sync] table; add it manually: [sync]\\n${newLine}`,
+    );
   }
 }
 
