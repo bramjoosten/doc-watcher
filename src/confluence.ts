@@ -64,12 +64,49 @@ export class ConfluenceClient {
     }
   }
 
-  private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  // Parse a Retry-After header. Confluence returns either a seconds count or
+  // an HTTP-date; both are valid per RFC 7231. Cap the result at 60s so a
+  // misbehaving server can't strand us for hours.
+  private parseRetryAfter(header: string | null): number | null {
+    if (!header) return null;
+    const seconds = Number(header);
+    if (!Number.isNaN(seconds) && seconds >= 0) return Math.min(seconds * 1000, 60_000);
+    const at = Date.parse(header);
+    if (!Number.isNaN(at)) return Math.max(0, Math.min(at - Date.now(), 60_000));
+    return null;
+  }
+
+  // fetch wrapper that retries 429 and 503 with backoff. Honours Retry-After;
+  // falls back to exponential (1s, 2s, 4s, 8s, 16s, capped at 60s). Max 5 retries
+  // then returns the last response (the caller's !res.ok branch will throw).
+  private async fetchWithRetry(url: string, init: RequestInit): Promise<Response> {
+    let attempt = 0;
+    while (true) {
+      const res = await fetch(url, init);
+      if (res.status !== 429 && res.status !== 503) return res;
+      if (attempt >= 5) return res;
+      const retryAfter = this.parseRetryAfter(res.headers.get('Retry-After'));
+      const waitMs = retryAfter ?? Math.min(60_000, 1000 * 2 ** attempt);
+      log.warn(
+        { status: res.status, url, attempt: attempt + 1, waitMs },
+        `rate limited; backing off`,
+      );
+      // Drain the body so the connection can be reused.
+      await res.text().catch(() => '');
+      await new Promise<void>((r) => setTimeout(r, waitMs));
+      attempt++;
+    }
+  }
+
+  private async request<T>(path: string, init: RequestInit = {}, opts: { retry?: boolean } = {}): Promise<T> {
     const url = path.startsWith('http') ? path : `${this.baseUrl}${path}`;
     const headers = new Headers(init.headers);
     headers.set('Authorization', `Bearer ${this.pat}`);
     headers.set('Accept', 'application/json');
-    const res = await fetch(url, { ...init, headers });
+    const initWithHeaders = { ...init, headers };
+    const res = opts.retry === false
+      ? await fetch(url, initWithHeaders)
+      : await this.fetchWithRetry(url, initWithHeaders);
     if (!res.ok) {
       const text = await res.text().catch(() => '');
       throw new Error(`Confluence request failed: ${res.status} ${res.statusText} ${url} :: ${text.slice(0, 200)}`);
@@ -79,7 +116,7 @@ export class ConfluenceClient {
 
   private async requestBinary(path: string): Promise<ArrayBuffer> {
     const url = path.startsWith('http') ? path : `${this.baseUrl}${path}`;
-    const res = await fetch(url, {
+    const res = await this.fetchWithRetry(url, {
       headers: { Authorization: `Bearer ${this.pat}` },
     });
     if (!res.ok) {
@@ -119,11 +156,15 @@ export class ConfluenceClient {
     return out;
   }
 
-  async getPage(id: string, expand: string[] = ['body.storage', 'version', 'ancestors', 'space']): Promise<ConfluencePage> {
+  async getPage(
+    id: string,
+    expand: string[] = ['body.storage', 'version', 'ancestors', 'space'],
+    opts: { retry?: boolean } = {},
+  ): Promise<ConfluencePage> {
     const params = new URLSearchParams();
     if (expand.length) params.set('expand', expand.join(','));
     const path = `/rest/api/content/${encodeURIComponent(id)}?${params.toString()}`;
-    return this.request<ConfluencePage>(path);
+    return this.request<ConfluencePage>(path, undefined, opts);
   }
 
   async getAttachments(pageId: string): Promise<ConfluenceAttachment[]> {

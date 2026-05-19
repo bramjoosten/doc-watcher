@@ -20,7 +20,7 @@ import { emptyState, readState, writeState } from './state.js';
 import { planScopes } from './walker.js';
 
 const BENCH_SAMPLE_SIZE = 30;
-const BENCH_CONCURRENCY_LEVELS = [1, 2, 5, 10, 20, 50, 100];
+const BENCH_CONCURRENCY_LEVELS = [1, 2, 5, 10, 20, 50];
 
 const FULL_ENUMERATION_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
@@ -236,7 +236,9 @@ async function runBench(): Promise<void> {
       sample.map((p) =>
         limiter(async () => {
           try {
-            await client.getPage(p.id);
+            // Bypass the client's 429/503 retry — bench needs to see the
+            // rate-limit cliff, not have it smoothed over.
+            await client.getPage(p.id, undefined, { retry: false });
           } catch {
             errors++;
           }
