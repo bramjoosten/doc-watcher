@@ -30,6 +30,11 @@ const BENCH_CONCURRENCY_LEVELS = [1, 2, 5, 10, 20];
 
 const FULL_ENUMERATION_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
+// Set by runBench when it completes; consumed (and cleared) by runSync at the
+// end so the bench's decision is restated alongside the sync summary instead
+// of being scrolled off the top by all the per-page progress lines.
+let lastBenchReport: string[] | null = null;
+
 function buildFullEnumerationCQL(watch: WatchEntry): string {
   return `(id = ${watch} OR ancestor = ${watch}) AND type = page`;
 }
@@ -106,23 +111,29 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
     if (sp) titleIndex.set(titleIndexKey(sp, page.title), page.id);
   }
 
-  const toFetch = [...seen.values()].filter((p) => {
+  const remaining = [...seen.values()].filter((p) => {
     const prev = state.pages[p.id];
     return !prev || prev.version !== (p.version?.number ?? 0);
   });
 
   // Split the work into new vs. updated for the post-sync summary.
-  const newPageIds = new Set(toFetch.filter((p) => !state.pages[p.id]).map((p) => p.id));
-  const updatedPageIds = new Set(toFetch.filter((p) => state.pages[p.id]).map((p) => p.id));
+  const newPageIds = new Set(remaining.filter((p) => !state.pages[p.id]).map((p) => p.id));
+  const updatedPageIds = new Set(remaining.filter((p) => state.pages[p.id]).map((p) => p.id));
+
+  // Keep the top-of-state counters fresh on every sync iteration. Both are
+  // also re-computed before the final writeState, but flushing them here means
+  // a per-page mid-sync state.json already shows current numbers.
+  state.total_watched_pages_on_remote = seen.size;
+  state.total_pages_downloaded = Object.keys(state.pages).length;
 
   log.info(
-    { candidates: seen.size, toFetch: toFetch.length, new: newPageIds.size, updated: updatedPageIds.size },
+    { candidates: seen.size, remaining: remaining.length, new: newPageIds.size, updated: updatedPageIds.size },
     'sync diff',
   );
 
   const syncIso = new Date().toISOString();
   const result = await downloadPages(
-    toFetch,
+    remaining,
     {
       config,
       client,
@@ -164,7 +175,7 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
         for (const r of results) fullSeen.add(r.id);
       }
       allIds = fullSeen;
-      log.info({ count: allIds.size }, 'full enumeration complete');
+      log.info({ count: allIds.size }, `daily full page-list refresh done (${allIds.size} pages on Confluence)`);
     }
 
     const toDelete = Object.keys(state.pages).filter((id) => !allIds.has(id));
@@ -187,7 +198,7 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
   // Only advance last_sync on a fully successful run. If any page failed,
   // keep last_sync where it was so the next CQL window still includes the
   // failed pages — their missing state.pages entries will pull them back
-  // into toFetch via the version diff. Successful pages have matching
+  // into remaining via the version diff. Successful pages have matching
   // versions in state and are skipped, so the cost is just re-running the
   // CQL search, not re-downloading completed pages.
   if (result.errors.length === 0) {
@@ -198,15 +209,16 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
       `last_sync NOT advanced because ${result.errors.length} page(s) failed; they'll be retried on the next run`,
     );
   }
+  state.total_pages_downloaded = Object.keys(state.pages).length;
   await writeState(outputDir, state);
 
-  // Count how much of toFetch landed successfully, split by new vs updated.
+  // Count how much of remaining landed successfully, split by new vs updated.
   const writtenSet = new Set(result.written);
   // result.written is relPaths, not ids. Cross-reference via state.pages.
-  // Simpler: derive succeeded-by-id from state.pages updates within toFetch.
+  // Simpler: derive succeeded-by-id from state.pages updates within remaining.
   // After downloadPages, every page it successfully wrote was inserted into
   // state.pages with its new version. We compare against the per-id sets.
-  // But toFetch's "new" entries didn't exist before, so a successful write
+  // But remaining's "new" entries didn't exist before, so a successful write
   // is detectable by state.pages[id] being present. Updated entries already
   // existed but got their version bumped — also detectable.
   // We didn't capture the pre-fetch versions for `updated` though. Instead,
@@ -234,7 +246,7 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
   // at the current version.
   const candidates = seen.size;
   const downloaded = result.written.length;
-  const skipped = candidates - toFetch.length;
+  const skipped = candidates - remaining.length;
 
   // Build a human-readable headline.
   let headline: string;
@@ -268,17 +280,13 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
     headline,
   );
 
-  // Explain the parallel_downloads value used this run and where it came from.
-  const pdValue = config.parallel_downloads;
-  if (pdValue !== undefined) {
-    log.info(
-      { parallel_downloads: pdValue },
-      `ran with parallel_downloads = ${pdValue} (from config.yaml — either a hand-set value or the value the autotune wrote on a previous run; to re-tune, comment the line out and run again)`,
-    );
-  } else {
-    log.info(
-      `ran with the fallback heuristic for parallel_downloads (config.yaml had no value and the autotune didn't write one this run — set the value manually or run again to trigger a fresh autotune)`,
-    );
+  // If the autotune ran this turn, restate its decision here — the per-level
+  // and "bench winner" lines emitted at startup get pushed off the top of the
+  // tail by all the per-page progress lines, so we replay the recap.
+  if (lastBenchReport && lastBenchReport.length > 0) {
+    const block = ['autotune ran this turn — recap:', ...lastBenchReport.map((l) => `  ${l}`)].join('\n');
+    log.info(block);
+    lastBenchReport = null;
   }
 }
 
@@ -425,6 +433,21 @@ async function runBench(): Promise<void> {
     { configPath, value: best.concurrency },
     `wrote parallel_downloads: ${best.concurrency} to config.yaml`,
   );
+
+  // Build a recap that runSync will print at the end of its run. It restates
+  // the per-level results, the peak, the safety margin, and the chosen value
+  // so the decision is right next to the sync summary, not buried at the top.
+  lastBenchReport = [
+    `sample size: ${BENCH_SAMPLE_SIZE} pages from root_page_id ${firstScope}`,
+    ...results.map(
+      (r) =>
+        `  level ${r.concurrency.toString().padStart(2)}: ${r.throughputPerSec.toFixed(2)} pages/s` +
+        (r.errors > 0 ? ` — ${r.errors} error(s)${r.firstError ? ` (first: ${r.firstError})` : ''}` : ''),
+    ),
+    `peak: parallel_downloads = ${peak.concurrency} (${peak.throughputPerSec} pages/s)`,
+    `chose: parallel_downloads = ${best.concurrency} — two tiers down from peak as headroom for sustained load (bench measures bursts of ${BENCH_SAMPLE_SIZE} pages; full sync sustains the load over thousands)`,
+    `wrote to config.yaml; pin a different value by hand if you want to override`,
+  ];
 }
 
 async function runReconvert(): Promise<void> {

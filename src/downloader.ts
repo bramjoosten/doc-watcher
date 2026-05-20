@@ -235,6 +235,9 @@ export async function downloadPages(pages: ConfluencePage[], opts: DownloadOptio
           opts.state.pages[detailed.id] = st;
           opts.knownPagePaths.set(detailed.id, result.relPath);
           opts.titleIndex.set(titleIndexKey(detailedSpace, detailed.title), detailed.id);
+          // Keep the top-of-state counter up to date even mid-sync, so an
+          // interrupted run's state.json still reflects the true on-disk count.
+          opts.state.total_pages_downloaded = Object.keys(opts.state.pages).length;
 
           if (written.length % PROGRESS_EVERY === 0) {
             log.info(

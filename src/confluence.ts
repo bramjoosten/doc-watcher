@@ -85,6 +85,9 @@ export class ConfluenceClient {
   // issuing Retry-After's faster than one request can ride them out.
   private async fetchWithRetry(url: string, init: RequestInit): Promise<Response> {
     let attempt = 0;
+    let backedOff = false;
+    // For readability in logs, trim the base URL from request URLs.
+    const shortUrl = url.startsWith(this.baseUrl) ? url.slice(this.baseUrl.length) : url;
     while (true) {
       // Honour any client-wide cooldown that a sibling request set.
       const now = Date.now();
@@ -92,8 +95,17 @@ export class ConfluenceClient {
         await new Promise<void>((r) => setTimeout(r, this.throttledUntilMs - now));
       }
       const res = await fetch(url, init);
-      if (res.status !== 429 && res.status !== 503) return res;
+      if (res.status !== 429 && res.status !== 503) {
+        if (backedOff && res.ok) {
+          log.info(
+            { url: shortUrl, attempts: attempt + 1 },
+            `recovered after backoff: ${shortUrl} succeeded on attempt ${attempt + 1}`,
+          );
+        }
+        return res;
+      }
       if (attempt >= 8) return res;
+      backedOff = true;
 
       // Read the body up-front: it usually carries Confluence's actual
       // explanation (e.g. "Rate limit exceeded for ..."), and reading it
@@ -110,8 +122,8 @@ export class ConfluenceClient {
       this.throttledUntilMs = Math.max(this.throttledUntilMs, Date.now() + waitMs);
       if (!cooldownAlreadyActive) {
         log.warn(
-          { status: res.status, attempt: attempt + 1, waitMs, body: bodySnippet || undefined },
-          `rate limited (${res.status} ${res.statusText}): ${bodySnippet || '(no body)'} — backing off ${waitMs}ms`,
+          { status: res.status, url: shortUrl, attempt: attempt + 1, waitMs, body: bodySnippet || undefined },
+          `rate limited (${res.status} ${res.statusText}) for ${shortUrl}: ${bodySnippet || '(no body)'} — backing off ${waitMs}ms`,
         );
       }
       await new Promise<void>((r) => setTimeout(r, waitMs));
@@ -170,19 +182,19 @@ export class ConfluenceClient {
     if (expand.length) params.set('expand', expand.join(','));
     const path = `/rest/api/content/search?${params.toString()}`;
     const out: ConfluencePage[] = [];
-    log.info({ cql }, 'enumerating pages from Confluence — this can take a while for large scopes');
+    log.info({ cql }, 'asking Confluence for the list of pages in scope — this can take a while for big subtrees');
     const started = Date.now();
     for await (const item of this.paginate<ConfluencePage>(path)) {
       out.push(item);
       // Pagination batches are 100 (limit param). Log every batch so the user
       // sees progress instead of a silent hang.
       if (out.length % 100 === 0) {
-        log.info({ enumerated: out.length, elapsedMs: Date.now() - started }, `enumerated ${out.length} pages so far`);
+        log.info({ pagesListed: out.length, elapsedMs: Date.now() - started }, `${out.length} pages listed so far`);
       }
     }
     log.info(
       { cql, total: out.length, elapsedMs: Date.now() - started },
-      `enumeration done: ${out.length} pages in ${Date.now() - started}ms`,
+      `Confluence returned ${out.length} pages in ${Date.now() - started}ms`,
     );
     return out;
   }

@@ -16,9 +16,9 @@ function emit(level: Level, a: unknown, b?: unknown): void {
   const pad = (n: number) => String(n).padStart(2, '0');
   const ts = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
   if (typeof a === 'string') {
-    stream(`${ts} ${level} ${a}`);
+    stream(`${ts} [${level}] ${a}`);
   } else {
-    stream(`${ts} ${level} ${b ?? ''}`, a);
+    stream(`${ts} [${level}] ${b ?? ''}`, a);
   }
 }
 

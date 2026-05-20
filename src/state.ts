@@ -10,13 +10,25 @@ export interface PageState {
 }
 
 export interface StateFile {
+  // Top-of-file counters for quick eyeball-verification. The `pages` map below
+  // gets large; these keep the high-level numbers visible at the top of the
+  // file without having to parse anything. JSON.stringify preserves insertion
+  // order, so as long as these stay declared first, they serialise first too.
+  total_watched_pages_on_remote: number;
+  total_pages_downloaded: number;
   last_sync: string | null;
   last_full_enumeration: string | null;
   pages: Record<string, PageState>;
 }
 
 export function emptyState(): StateFile {
-  return { last_sync: null, last_full_enumeration: null, pages: {} };
+  return {
+    total_watched_pages_on_remote: 0,
+    total_pages_downloaded: 0,
+    last_sync: null,
+    last_full_enumeration: null,
+    pages: {},
+  };
 }
 
 // State lives inside the output directory — hidden by the leading dot so it
@@ -32,6 +44,8 @@ export async function readState(outputDir: string): Promise<StateFile> {
     const buf = await readFile(path, 'utf8');
     const parsed = JSON.parse(buf) as Partial<StateFile>;
     return {
+      total_watched_pages_on_remote: parsed.total_watched_pages_on_remote ?? 0,
+      total_pages_downloaded: parsed.total_pages_downloaded ?? 0,
       last_sync: parsed.last_sync ?? null,
       last_full_enumeration: parsed.last_full_enumeration ?? null,
       pages: parsed.pages ?? {},
