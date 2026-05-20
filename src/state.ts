@@ -8,6 +8,9 @@ export interface PageState {
   title: string;
   space: string;
   ancestors: string[];
+  last_modified: string | null;       // ISO timestamp from page.version.when
+  last_modified_by: string | null;    // displayName from page.version.by
+  webui_url: string;                  // full clickable URL — base + /display/...
 }
 
 export interface StateFile {

@@ -49,11 +49,56 @@ export function sourceUrlFor(baseUrl: string, pageId: string): string {
   return `${baseUrl.replace(/\/$/, '')}/pages/viewpage.action?pageId=${pageId}`;
 }
 
-// Build the body of the .md file: a one-line markdown autolink to the Confluence
-// source, then the title as an H1, then the converted body. No frontmatter — all
-// structural metadata lives in SQLite (state).
-export function buildMarkdownBody(sourceUrl: string, title: string, markdown: string): string {
-  return `<${sourceUrl}>\n\n# ${title}\n\n${markdown}\n`;
+// Full clickable webUI URL. Prefers Confluence's own `_links.webui` (the
+// human-friendly /display/SPACE/Title form) when available, falls back to
+// the viewpage.action form. Always absolute so it can be clicked from the
+// index file directly.
+export function buildWebUiUrl(baseUrl: string, page: ConfluencePage): string {
+  const base = baseUrl.replace(/\/$/, '');
+  const webui = page._links?.webui;
+  if (webui) {
+    if (webui.startsWith('http')) return webui;
+    return `${base}${webui.startsWith('/') ? '' : '/'}${webui}`;
+  }
+  return sourceUrlFor(baseUrl, page.id);
+}
+
+// Build the body of the .md file. Frontmatter is composed FROM the state
+// entry, not from raw page data — so the index file remains the source of
+// truth and the frontmatter is a regeneratable view. `reconvert` and the
+// online sync both produce identical .md given identical state.
+//
+// The webui_url already replaces the old "<source-url>" autolink at the top
+// of the body, so the header is now just the frontmatter and the H1 title.
+export interface MarkdownMetadata {
+  title: string;
+  version: number;
+  last_modified: string | null;
+  last_modified_by: string | null;
+  webui_url: string;
+}
+
+function yamlString(s: string): string {
+  // Cheap YAML string escape: wrap in double quotes, escape backslashes + quotes.
+  return `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
+export function buildMarkdownBody(meta: MarkdownMetadata, markdown: string): string {
+  const lines = [
+    '---',
+    `title: ${yamlString(meta.title)}`,
+    `version: ${meta.version}`,
+    `last_modified: ${meta.last_modified ? yamlString(meta.last_modified) : 'null'}`,
+    `last_modified_by: ${meta.last_modified_by ? yamlString(meta.last_modified_by) : 'null'}`,
+    `webui_url: ${yamlString(meta.webui_url)}`,
+    '---',
+    '',
+    `# ${meta.title}`,
+    '',
+    markdown,
+    '',
+  ];
+  return lines.join('\n');
 }
 
 function resolveRelativePagePath(pageRelPath: string, targetRelPath: string): string {
@@ -186,8 +231,16 @@ async function fetchAndWriteOne(
   // Write the raw storage-format HTML next to the .md so reconvert can rebuild the
   // markdown later without re-hitting Confluence.
   const htmlAbsPath = htmlPathFor(absPath);
-  const sourceUrl = sourceUrlFor(opts.config.base_url, page.id);
-  const mdBody = buildMarkdownBody(sourceUrl, page.title, conversion.markdown);
+  const mdBody = buildMarkdownBody(
+    {
+      title: page.title,
+      version: page.version?.number ?? 0,
+      last_modified: page.version?.when ?? null,
+      last_modified_by: page.version?.by?.displayName ?? null,
+      webui_url: buildWebUiUrl(opts.config.base_url, page),
+    },
+    conversion.markdown,
+  );
 
   await mkdir(dirname(absPath), { recursive: true });
   await writeFile(htmlAbsPath, html, 'utf8');
@@ -225,14 +278,16 @@ export async function downloadPages(pages: ConfluencePage[], opts: DownloadOptio
           attachments.push(...result.attachments);
           // Update state in place.
           const detailedSpace = detailed.space?.key ?? 'UNKNOWN';
-          const st: PageState = {
+          opts.state.pages[detailed.id] = {
             version: detailed.version?.number ?? 0,
             path: result.relPath,
             title: detailed.title,
             space: detailedSpace,
             ancestors: (detailed.ancestors ?? []).map((a) => a.id),
+            last_modified: detailed.version?.when ?? null,
+            last_modified_by: detailed.version?.by?.displayName ?? null,
+            webui_url: buildWebUiUrl(opts.config.base_url, detailed),
           };
-          opts.state.pages[detailed.id] = st;
           opts.knownPagePaths.set(detailed.id, result.relPath);
           opts.titleIndex.set(titleIndexKey(detailedSpace, detailed.title), detailed.id);
           // Keep the top-of-state counter up to date even mid-sync, so an

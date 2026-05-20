@@ -14,7 +14,6 @@ import {
   buildMarkdownBody,
   downloadPages,
   pickPageRelPath,
-  sourceUrlFor,
   titleIndexKey,
 } from './downloader.js';
 import { log } from './log.js';
@@ -550,8 +549,16 @@ async function runReconvert(): Promise<void> {
         titleIndex: mergedTitle,
       }),
     );
-    const sourceUrl = sourceUrlFor(config.base_url, id);
-    const body = buildMarkdownBody(sourceUrl, p.title, conversion.markdown);
+    const body = buildMarkdownBody(
+      {
+        title: p.title,
+        version: p.version,
+        last_modified: p.last_modified,
+        last_modified_by: p.last_modified_by,
+        webui_url: p.webui_url,
+      },
+      conversion.markdown,
+    );
     await writeFile(mdAbs, body, 'utf8');
     processed++;
   }

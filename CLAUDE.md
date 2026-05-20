@@ -31,9 +31,11 @@ Node.js, TypeScript, run via `tsx`.
 
 **Minimize third-party dependencies.** Reach for the Node standard library first; a dep only earns its keep when the alternative would be hundreds of lines of nontrivial code (XHTML parsing, HTML→markdown conversion). **No native modules** — the tool has to install on locked-down corporate machines where the npm proxy MITMs TLS and prebuilt binaries fail to download. Pure JavaScript across the board. The CLI is a plain Node entry point using `process.argv` — no `commander` / `yargs` / etc. Logging is `console.log` / `console.error`. No test framework for now.
 
-### State: plain JSON, not frontmatter
+### State: per-root JSON indexes (source of truth) + lightweight frontmatter view
 
-The `.md` files have **no YAML frontmatter** — they're plain prose, easier for grep, editors, and LLMs to consume. All structural metadata (Confluence ID, version, ancestors, last-modified, links, embeds) lives in **per-root index files** at `<output_dir>/index-<slug>--<root_id>.json` — one per entry in `root_page_ids`. Each index covers the pages in its own subtree; the indexes are independent on disk but the resolver maps that link pages to local paths are merged across indexes at runtime so cross-root `ac:link` references still resolve. Writes are atomic via `tmp` + `rename` — interrupted runs never leave a half-written index file.
+State lives in **per-root index files** at `<output_dir>/index-<slug>--<root_id>.json` — one per entry in `root_page_ids`. Each index covers the pages in its own subtree; the indexes are independent on disk but the resolver maps that link pages to local paths are merged across indexes at runtime so cross-root `ac:link` references still resolve. Writes are atomic via `tmp` + `rename` — interrupted runs never leave a half-written index file.
+
+The index is the **source of truth** for all structural metadata: Confluence ID, version, ancestors, last-modified, links, embeds, webui URL. The `.md` files carry a small **regeneratable** YAML frontmatter view of the same data, so a single `.md` is self-describing without consulting the index — but the index always wins. Frontmatter fields are: `title`, `version`, `last_modified`, `last_modified_by`, `webui_url`. The frontmatter is rewritten by `reconvert` from index data on every run; nothing depends on the body of the frontmatter being canonical, so it can drift mid-run without consequence (the next sync or reconvert overwrites it).
 
 The top of each index carries identification and counters — `root_page_id`, `root_title`, `total_watched_pages_on_remote` (what Confluence reported in the last sync's CQL window), `total_pages_downloaded` (current size of the `pages` map), and the `last_sync` / `last_full_enumeration` timestamps. Counters are updated incrementally as each page is written, so an interrupted run leaves them in sync with what's actually on disk. The bulk `pages` map sits below.
 
@@ -45,7 +47,7 @@ State is **flushed after every successful page write** during a sync, not just a
 
 JSON over SQLite is deliberate: doc-watcher is single-process and the whole state is small (a few hundred KB even for 10k pages), so the durability and concurrency advantages of an embedded DB don't pay back the cost of a native dependency that may not install on locked-down corporate machines.
 
-**Source-URL header.** The first line of every converted `.md` is a markdown autolink to the Confluence source page, e.g. `<https://confluence.example.com/pages/viewpage.action?pageId=12345>`. It renders as a clickable link in any markdown viewer, keeps the file traceable on its own, and is regenerated during `reconvert`. Beyond this single line the body is unadorned markdown.
+**Markdown frontmatter view.** Every converted `.md` starts with a YAML frontmatter block carrying `title`, `version`, `last_modified`, `last_modified_by`, and `webui_url`. The `webui_url` is the full clickable URL (with base) so the file is self-traceable without consulting the index. The frontmatter is composed from the per-root index entry at write time — the index is the source of truth, the frontmatter is a regeneratable view; `reconvert` rewrites it from index data on every run. The body itself starts with `# <title>` as the H1 (Confluence's storage-format body doesn't include the title, so we add it for plain markdown viewers that don't read frontmatter).
 
 ### File layout
 

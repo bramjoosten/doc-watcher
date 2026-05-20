@@ -57,7 +57,7 @@ docs/
     attachments/67890/diagram.png
 ```
 
-The `.md` has no YAML frontmatter — just the page body, prefixed with a one-line autolink back to the Confluence source so anyone reading the file knows where it came from. All structured metadata (id, version, ancestors, links, embeds) lives in `<output_dir>/index-<slug>--<root_id>.json` — one index per configured root.
+Each `.md` opens with a small YAML frontmatter block — `title`, `version`, `last_modified`, `last_modified_by`, `webui_url` (full clickable URL back to the Confluence page) — followed by the title as an H1 and the converted body. The frontmatter is a regeneratable view of the per-root index file (`<output_dir>/index-<slug>--<root_id>.json`); the index stays the source of truth for everything (id, version, ancestors, links, embeds), and `reconvert` rebuilds the frontmatter from index data on every run.
 
 ## Limitations
 

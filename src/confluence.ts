@@ -8,6 +8,7 @@ export interface ConfluenceClientOptions {
 export interface PageVersion {
   number: number;
   when?: string;
+  by?: { username?: string; displayName?: string };
 }
 
 export interface PageAncestor {
