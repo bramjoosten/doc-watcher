@@ -1,8 +1,6 @@
 # doc-watcher
 
-Mirror a Confluence Server (DC 7.9+) tree to local files — the raw HTML (the durable source of truth) plus a clean Markdown view next to it for `rg`, editors, and local AI. PAT-authenticated, walks one or more configured page subtrees, incrementally re-syncs only changed pages.
-
-Webhooks are out of scope (they need Confluence admin access; we only assume a user-level PAT). Change detection is CQL polling on `lastmodified`.
+Mirror Confluence Server pages to local files — raw HTML alongside converted Markdown, incrementally re-synced. PAT-authenticated, CLI, built for `rg` and local AI workflows.
 
 ## Setup
 
@@ -13,12 +11,11 @@ npm install
 cp config.example.yaml config.yaml
 ```
 
-Open `config.yaml` and fill in:
-- `confluence.base_url` — your Confluence root URL.
-- `confluence.pat` — your Personal Access Token (creation steps are in the comment above the field).
-- `root_page_ids` — one Confluence page id (as a string) or a list of them; each id is the root of a subtree to mirror.
+Edit `config.yaml`:
 
-`config.yaml` is gitignored; the example file stays clean.
+- `base_url` — your Confluence root URL
+- `pat` — Personal Access Token (creation steps are in the file's comment)
+- `root_page_ids` — one page id or a list; each is the root of a subtree to mirror
 
 ## Run
 
@@ -26,43 +23,11 @@ Open `config.yaml` and fill in:
 npm start
 ```
 
-That's the daily-driver. With no args it runs an **incremental sync** — the first invocation does the bulk download (state is empty), every subsequent run only fetches pages that changed since the last sync. Then it exits. Run it again whenever you want fresh docs.
+Incremental sync — the first invocation downloads everything, every later run only fetches what changed since `last_sync`. Resumable on Ctrl+C: just run again to pick up where you stopped. Concurrency self-tunes from Confluence's `X-RateLimit-*` headers, so there's nothing to manually configure beyond the optional `parallel_downloads` ceiling.
 
-Concurrency is managed by an adaptive limiter informed by Confluence's `X-RateLimit-*` headers — it starts at 1, ramps up toward `parallel_downloads` (default 20) when the server says there's budget, and throttles down before hitting 429. No autotune step needed; the `parallel_downloads` value in `config.yaml` is just an upper ceiling.
+## Other verbs
 
-**Resumable**: state is flushed after every successful page write. If you Ctrl+C mid-sync (or anything else interrupts the process), just run `npm start` again — already-downloaded pages are skipped via their stored version number, and the sync picks up where it left off.
+- `npm start -- refresh` — full re-download (ignores `last_sync`, reconciles deletes)
+- `npm start -- reconvert` — regenerate every `.md` from the saved `.html` (no network)
 
-## One-shot verbs
-
-For manual operations instead of the default sync flow:
-
-- `npm start -- sync` — one incremental sync, then exit (same as the default).
-- `npm start -- refresh` — full re-download (ignores `last_sync`, reconciles deletes).
-- `npm start -- reconvert` — regenerate every `.md` from the saved `.html`. No network.
-
-## Output layout
-
-The local tree mirrors Confluence; each page's id is appended after `--` so title changes become clean `git mv`s. Every page produces two files side by side — `.html` (raw storage format, the source of truth) and `.md` (the human-readable view derived from it).
-
-```
-docs/
-  index-team-foo--12345.json          # one per configured root id; carries page metadata
-  index-team-bar--67890.json          # for that subtree
-  ENG/
-    _index.html / _index.md
-    onboarding--67890/
-      _index.html / _index.md
-      setup-guide--99999.html
-      setup-guide--99999.md
-    attachments/67890/diagram.png
-```
-
-Each `.md` opens with a small YAML frontmatter block — `title`, `version`, `last_modified`, `last_modified_by`, `webui_url` (full clickable URL back to the Confluence page) — followed by the title as an H1 and the converted body. The frontmatter is a regeneratable view of the per-root index file (`<output_dir>/index-<slug>--<root_id>.json`); the index stays the source of truth for everything (id, version, ancestors, links, embeds), and `reconvert` rebuilds the frontmatter from index data on every run.
-
-## Limitations
-
-- Webhooks are not supported — only PAT-level access is assumed. CQL polling is the change-detection mechanism.
-- `ac:link`s pointing outside any configured scope fall back to absolute Confluence URLs.
-- Attachments are downloaded only when referenced by an `ac:image` macro; arbitrary page attachments are not mirrored.
-
-See [`CLAUDE.md`](./CLAUDE.md) for the full spec.
+See [`CLAUDE.md`](./CLAUDE.md) for the full spec — output layout, file formats, frontmatter shape, adaptive concurrency, limitations.
