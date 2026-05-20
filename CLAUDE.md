@@ -104,7 +104,7 @@ Confluence Server has no dedicated sync endpoint, but CQL on `/rest/api/content/
 
 For a 10k-page space the typical delta per 5-minute window is 0–50 pages — sub-second API time. `last_sync` in the state file is the lower bound; first run has none and does a full enumeration. Every subsequent run is delta-only.
 
-**Deletes** aren't visible in the incremental query (they're just absent). The default `sync` runs a cheap id-only full enumeration once per day to reconcile orphans (gated by `sources.last_full_enum`). `refresh` always does a full enumeration.
+**Deletes** aren't visible in the incremental query (they're just absent). The default `sync` runs a cheap id-only full enumeration once per day to reconcile orphans (gated by per-root `last_full_enumeration`). `refresh` always does a full enumeration. Pages that have been **deleted or archived** in Confluence disappear from CQL results, fall into the orphan set on the next full enumeration, and both their `.html` and `.md` are removed from disk; the state entry is dropped too.
 
 ### Confluence REST endpoints used
 

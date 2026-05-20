@@ -239,10 +239,15 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
       for (const id of toDelete) {
         const st = root.state.pages[id];
         if (!st) continue;
-        const abs = resolve(outputDir, st.path);
+        // Remove both .md and the .html companion. A page deleted or archived
+        // in Confluence no longer appears in CQL results, so it falls into
+        // toDelete here — both on-disk files go.
+        const mdAbs = resolve(outputDir, st.path);
+        const htmlAbs = htmlPathFor(mdAbs);
         try {
-          await rm(abs, { force: true });
-          log.info({ rootId: root.rootId, id, path: st.path }, 'deleted orphan');
+          await rm(mdAbs, { force: true });
+          await rm(htmlAbs, { force: true });
+          log.info({ rootId: root.rootId, id, path: st.path, title: st.title }, `removed deleted/archived page: ${st.title} (${id})`);
         } catch (err) {
           log.warn({ rootId: root.rootId, err, id }, 'orphan delete failed');
         }
