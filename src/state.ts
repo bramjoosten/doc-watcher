@@ -94,7 +94,7 @@ function withDescription(state: StateFile): unknown {
   return {
     description: {
       purpose: `Source of truth for doc-watcher's sync state of Confluence root page ${state.root_page_id} ("${state.root_title}")`,
-      note: 'Updated mid-sync via the sibling .jsonl append-log; rewritten in full at end of sync. The sibling tree-*.json is a derived, human-navigation view of the same data.',
+      note: 'This is a full snapshot, rewritten only at the END of each sync. During a sync the .json is NOT touched (it would be wasteful to re-serialise an MB-sized file on every page); in-flight page writes append to a sibling .jsonl, which is overlaid (last-wins by id) on the next read for transparent interrupt recovery. The sibling tree-*.json is a derived human-navigation view of the same data.',
     },
     ...state,
   };
