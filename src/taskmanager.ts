@@ -267,7 +267,8 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
     // recovery; finalize wipes it because the .json now has everything.
     await finalizeIndex(root.indexPath, root.state);
     // Write the per-root tree.json for human navigation via IDE folding.
-    const tree = buildTree(root.state);
+    const indexBaseName = root.indexPath.split('/').pop() ?? 'index.json';
+    const tree = buildTree(root.state, indexBaseName);
     if (tree) await writeTree(treePathFromIndexPath(root.indexPath), tree);
 
     // Per-root attribution + accumulate into totals.

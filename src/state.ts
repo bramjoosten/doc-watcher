@@ -149,12 +149,24 @@ export async function finalizeIndex(filePath: string, state: StateFile): Promise
 // Derived view of the subtree, written next to the index so the user can
 // navigate the page hierarchy via IDE code-folding. Same per-root scoping
 // as the index; filename derives from the index path so a title-rename
-// keeps both files together.
+// keeps both files together. This is a reference/navigation document for
+// humans — the sibling index-*.json is the source of truth.
 export interface TreeNode {
   id: string;
   title: string;
-  path: string;
+  webui_url: string;
+  last_modified: string | null;
+  last_modified_by: string | null;
   children: TreeNode[];
+}
+
+export interface TreeDocument {
+  explanation: {
+    purpose: string;
+    source_of_truth: string;
+    note: string;
+  };
+  root: TreeNode;
 }
 
 export function treePathFromIndexPath(indexPath: string): string {
@@ -162,7 +174,7 @@ export function treePathFromIndexPath(indexPath: string): string {
   return indexPath.replace(/(^|\/)index-([^/]+)$/, '$1tree-$2');
 }
 
-export function buildTree(state: StateFile): TreeNode | null {
+export function buildTree(state: StateFile, indexFileName: string): TreeDocument | null {
   const rootId = state.root_page_id;
   const rootPage = state.pages[rootId];
   if (!rootPage) return null;
@@ -184,13 +196,27 @@ export function buildTree(state: StateFile): TreeNode | null {
       const tb = state.pages[b]?.title ?? b;
       return ta.localeCompare(tb);
     });
-    return { id, title: page.title, path: page.path, children: childIds.map(node) };
+    return {
+      id,
+      title: page.title,
+      webui_url: page.webui_url,
+      last_modified: page.last_modified,
+      last_modified_by: page.last_modified_by,
+      children: childIds.map(node),
+    };
   };
 
-  return node(rootId);
+  return {
+    explanation: {
+      purpose: 'Reference document for human navigation. Use your IDE\'s JSON code-folding to browse the page hierarchy.',
+      source_of_truth: `${indexFileName} (sibling file) — this tree is derived from it.`,
+      note: 'Regenerated at the end of every sync — do not edit by hand.',
+    },
+    root: node(rootId),
+  };
 }
 
-export async function writeTree(treePath: string, tree: TreeNode): Promise<void> {
+export async function writeTree(treePath: string, tree: TreeDocument): Promise<void> {
   await mkdir(dirname(treePath), { recursive: true });
   const tmp = `${treePath}.tmp`;
   await writeFile(tmp, `${JSON.stringify(tree, null, 2)}\n`, 'utf8');

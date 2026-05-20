@@ -51,7 +51,7 @@ JSON over SQLite is deliberate: doc-watcher is single-process and the whole stat
 
 **Per-page write goes to a sibling `.jsonl`, finalized into `.json` at end of sync.** Rewriting the full ~MB-sized `.json` on every page flush was wasteful. Each per-page success appends one line to `<output_dir>/index-<slug>--<id>.jsonl` instead. At the end of each per-root sync, `finalizeIndex` collapses the in-memory state into a fresh `.json` snapshot and deletes the `.jsonl`. If a sync is interrupted, the `.jsonl` persists; the next `readIndex` overlays its lines onto the loaded `.json` (last-wins by id), so resume is transparent.
 
-**Tree view.** Alongside each `index-<slug>--<id>.json`, a `tree-<slug>--<id>.json` carries a nested `{ id, title, path, children: [...] }` representation of the subtree — handy for IDE code-folding and visual navigation. Regenerated from index at every `finalizeIndex`.
+**Tree view.** Alongside each `index-<slug>--<id>.json`, a `tree-<slug>--<id>.json` carries a nested human-oriented view of the subtree — handy for IDE code-folding and visual navigation. Top-level shape is `{ explanation: { purpose, source_of_truth, note }, root: { id, title, webui_url, last_modified, last_modified_by, children: [...] } }`. The `explanation` block exists because the tree is a *reference document*, not state — the source of truth is the sibling index file. The `webui_url` on each node is a full clickable URL into Confluence. Regenerated from the index at every `finalizeIndex`.
 
 ### File layout
 
