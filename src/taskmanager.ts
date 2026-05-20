@@ -85,10 +85,14 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
     for (const a of page.ancestors ?? []) pagesWithChildren.add(a.id);
   }
 
+  // The configured root ids — used by pickPageRelPath to trim ancestor folders
+  // above the root so the on-disk tree starts where the user said to.
+  const rootPageIds = new Set(config.root_page_ids);
+
   const knownPagePaths = new Map<string, string>();
   for (const [id, st] of Object.entries(state.pages)) knownPagePaths.set(id, st.path);
   for (const page of seen.values()) {
-    knownPagePaths.set(page.id, pickPageRelPath(page, pagesWithChildren));
+    knownPagePaths.set(page.id, pickPageRelPath(page, pagesWithChildren, rootPageIds));
   }
 
   // Title→id map keyed by `${spaceKey}::${title}`. Seed from state (unchanged pages from
@@ -127,6 +131,7 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
       knownPagePaths,
       pagesWithChildren,
       titleIndex,
+      rootPageIds,
       // Flush after every successful page so an interrupt is resumable.
       // `last_sync` stays at its previous value until the end of this run,
       // so on resume the same CQL diff is re-issued; pages already in state
@@ -262,6 +267,19 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
     },
     headline,
   );
+
+  // Explain the parallel_downloads value used this run and where it came from.
+  const pdValue = config.parallel_downloads;
+  if (pdValue !== undefined) {
+    log.info(
+      { parallel_downloads: pdValue },
+      `ran with parallel_downloads = ${pdValue} (from config.yaml — either a hand-set value or the value the autotune wrote on a previous run; to re-tune, comment the line out and run again)`,
+    );
+  } else {
+    log.info(
+      `ran with the fallback heuristic for parallel_downloads (config.yaml had no value and the autotune didn't write one this run — set the value manually or run again to trigger a fresh autotune)`,
+    );
+  }
 }
 
 async function runBench(): Promise<void> {

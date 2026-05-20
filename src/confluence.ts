@@ -96,13 +96,16 @@ export class ConfluenceClient {
       if (attempt >= 8) return res;
       const retryAfter = this.parseRetryAfter(res.headers.get('Retry-After'));
       const waitMs = retryAfter ?? Math.min(60_000, 1000 * 2 ** attempt);
-      // Tell every other in-flight request to pause for the same window so
-      // we don't pile retries on a rate-limited server.
+      // If a sibling already established a cooldown that covers this wait,
+      // we're in the same 429 wave — don't spam the same warning per request.
+      const cooldownAlreadyActive = Date.now() < this.throttledUntilMs;
       this.throttledUntilMs = Math.max(this.throttledUntilMs, Date.now() + waitMs);
-      log.warn(
-        { status: res.status, url, attempt: attempt + 1, waitMs },
-        `rate limited; backing off (client-wide cooldown ${waitMs}ms)`,
-      );
+      if (!cooldownAlreadyActive) {
+        log.warn(
+          { status: res.status, attempt: attempt + 1, waitMs },
+          `rate limited; backing off ${waitMs}ms (cooldown applies to all in-flight requests)`,
+        );
+      }
       // Drain the body so the connection can be reused.
       await res.text().catch(() => '');
       await new Promise<void>((r) => setTimeout(r, waitMs));

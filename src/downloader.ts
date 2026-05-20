@@ -27,6 +27,9 @@ export interface DownloadOptions {
   pagesWithChildren: Set<string>;
   // Pre-built map: `${spaceKey}::${title}` → page id. Used to resolve ac:link[ri:page] hits.
   titleIndex: Map<string, string>;
+  // Configured root page ids. Used to trim Confluence's full ancestor chain
+  // so the on-disk tree starts at the user's chosen root, not the space root.
+  rootPageIds: Set<string>;
   // Called after each successful page write so state is persisted incrementally.
   // If the process is interrupted mid-sync, the next run resumes from the last
   // flushed state instead of re-downloading the whole batch.
@@ -66,11 +69,29 @@ export function titleIndexKey(spaceKey: string, title: string): string {
 export function pickPageRelPath(
   page: ConfluencePage,
   pagesWithChildren: Set<string>,
+  rootPageIds: Set<string>,
 ): string {
   const spaceKey = page.space?.key ?? 'UNKNOWN';
   const ancestors = (page.ancestors ?? []).map((a) => ({ id: a.id, title: a.title ?? a.id }));
-  // Drop the space root itself if it appears as ancestor.
-  const filteredAncestors = ancestors.filter((a) => a.id !== page.id);
+  // Drop the page itself if it appears as ancestor (Confluence sometimes does this).
+  let filteredAncestors = ancestors.filter((a) => a.id !== page.id);
+
+  // Skip ancestors above the configured root. Without this, Confluence's full
+  // ancestor chain (space-root → intermediate → ... → configured-root → page)
+  // produces empty subdirs on disk for every ancestor we don't actually watch.
+  // If the page itself is a configured root, drop everything; otherwise find
+  // the deepest ancestor that's a configured root and slice from there.
+  if (rootPageIds.has(page.id)) {
+    filteredAncestors = [];
+  } else {
+    for (let i = filteredAncestors.length - 1; i >= 0; i--) {
+      if (rootPageIds.has(filteredAncestors[i]!.id)) {
+        filteredAncestors = filteredAncestors.slice(i);
+        break;
+      }
+    }
+  }
+
   const isSpaceRoot = filteredAncestors.length === 0 && page.title.trim().toLowerCase() === spaceKey.toLowerCase();
   if (isSpaceRoot) return spaceIndexPath(spaceKey);
   if (pagesWithChildren.has(page.id)) {
@@ -116,7 +137,7 @@ async function fetchAndWriteOne(
   syncIso: string,
 ): Promise<{ relPath: string; attachments: string[] }> {
   const spaceKey = page.space?.key ?? 'UNKNOWN';
-  const relPath = pickPageRelPath(page, opts.pagesWithChildren);
+  const relPath = pickPageRelPath(page, opts.pagesWithChildren, opts.rootPageIds);
   const absPath = join(opts.outputDir, relPath);
 
   const attachmentRefs: string[] = [];

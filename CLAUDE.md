@@ -83,6 +83,8 @@ docs/
 
 **Filename rule.** Each page produces two files side-by-side: `<slug>--<id>.html` (raw Confluence storage format) and `<slug>--<id>.md` (derived markdown). Slug is the lowercase, kebab-cased, ASCII-folded page title. The `--<id>` suffix is the durable anchor — if the state file is ever lost, files can still be matched back to their Confluence pages by ID alone.
 
+**Ancestors above the configured `root_page_id` are stripped from the path.** Confluence returns the full ancestor chain on every page (space root → intermediate → ... → configured root → page); using every level as a directory would create empty subdirs on disk for ancestors we don't watch. `pickPageRelPath` finds the deepest ancestor that's in the configured `root_page_ids` set and starts the path from there, producing `<space>/<configured-root>/<intermediate>/<page>` instead of `<space>/<intermediate-1>/<intermediate-2>/.../<configured-root>/<page>`.
+
 **Page titles can change**, so filenames can change between syncs. The watcher detects renames via the state entry (keyed by ID): when title changes, it does the local rename (file or folder) without re-fetching the body. A re-parent moves the file or folder under a new parent. History is preserved if the user's `docs/` is under git.
 
 **Parent vs leaf.** A page with children becomes a folder `<slug>--<id>/` containing `_index.html` and `_index.md`. A leaf is two flat files. This mirrors the way most static-site tools think about hierarchy.
