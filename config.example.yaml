@@ -20,12 +20,9 @@ output_dir: ./docs
 # Non-inline file attachments (PDFs, decks, etc.) are not mirrored either way.
 include_attachments: false
 
-# Confluence page ids whose subtrees to mirror — that page plus every
-# descendant beneath it, any depth. Accept either a single id or a list:
+# Confluence page id(s) whose subtree(s) to mirror. One id or a list:
 #   root_page_ids: "123456"
-#   root_page_ids:
-#     - "123456"
-#     - "234567"
+#   root_page_ids: ["123456", "234567"]
 # Find the id in the URL (?pageId=NNNNN); if you only see the pretty
-# /display/SPACE/Title form, click Edit and the id shows up.
+# /display/SPACE/Title form, click Edit and the id appears.
 root_page_ids: "123456"
