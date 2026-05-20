@@ -94,20 +94,26 @@ export class ConfluenceClient {
       const res = await fetch(url, init);
       if (res.status !== 429 && res.status !== 503) return res;
       if (attempt >= 8) return res;
+
+      // Read the body up-front: it usually carries Confluence's actual
+      // explanation (e.g. "Rate limit exceeded for ..."), and reading it
+      // here also drains the response for connection reuse.
+      const body = (await res.text().catch(() => '')).replace(/\s+/g, ' ').trim();
+      const bodySnippet = body.slice(0, 160);
+
       const retryAfter = this.parseRetryAfter(res.headers.get('Retry-After'));
-      const waitMs = retryAfter ?? Math.min(60_000, 1000 * 2 ** attempt);
-      // If a sibling already established a cooldown that covers this wait,
-      // we're in the same 429 wave — don't spam the same warning per request.
+      // Floor the wait at 1s. Confluence sometimes returns `Retry-After: 0`,
+      // which without a floor means "immediately re-fire" → another 429.
+      const waitMs = Math.max(1000, retryAfter ?? Math.min(60_000, 1000 * 2 ** attempt));
+
       const cooldownAlreadyActive = Date.now() < this.throttledUntilMs;
       this.throttledUntilMs = Math.max(this.throttledUntilMs, Date.now() + waitMs);
       if (!cooldownAlreadyActive) {
         log.warn(
-          { status: res.status, attempt: attempt + 1, waitMs },
-          `rate limited; backing off ${waitMs}ms (cooldown applies to all in-flight requests)`,
+          { status: res.status, attempt: attempt + 1, waitMs, body: bodySnippet || undefined },
+          `rate limited (${res.status} ${res.statusText}): ${bodySnippet || '(no body)'} — backing off ${waitMs}ms`,
         );
       }
-      // Drain the body so the connection can be reused.
-      await res.text().catch(() => '');
       await new Promise<void>((r) => setTimeout(r, waitMs));
       attempt++;
     }
