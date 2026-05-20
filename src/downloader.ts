@@ -210,6 +210,10 @@ export async function downloadPages(pages: ConfluencePage[], opts: DownloadOptio
   const written: string[] = [];
   const attachments: string[] = [];
   const errors: { id: string; error: unknown }[] = [];
+  // Periodic progress: log every Nth successful page so the user knows the
+  // sync is making progress even when most output is just retry warnings.
+  const PROGRESS_EVERY = 100;
+  const total = pages.length;
 
   await Promise.all(
     pages.map((page) =>
@@ -231,6 +235,13 @@ export async function downloadPages(pages: ConfluencePage[], opts: DownloadOptio
           opts.state.pages[detailed.id] = st;
           opts.knownPagePaths.set(detailed.id, result.relPath);
           opts.titleIndex.set(titleIndexKey(detailedSpace, detailed.title), detailed.id);
+
+          if (written.length % PROGRESS_EVERY === 0) {
+            log.info(
+              { downloaded: written.length, of: total, lastId: detailed.id, lastTitle: detailed.title },
+              `progress: ${written.length} of ${total} downloaded (last: ${detailed.id} — ${detailed.title})`,
+            );
+          }
           // Persist after every successful page so an interrupt is recoverable.
           // writeState is atomic (.tmp + rename); concurrent calls just clobber
           // each other's renames, which is fine — they all write the same in-memory
