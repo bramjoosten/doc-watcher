@@ -1,12 +1,25 @@
 import { log } from './log.js';
 
+export interface RateLimitBudget {
+  limit: number;            // X-RateLimit-Limit
+  remaining: number;        // X-RateLimit-Remaining
+  intervalSeconds: number;  // X-RateLimit-Interval-Seconds
+  fillRate: number;         // X-RateLimit-FillRate
+  // Sustainable rate the server actually permits — fillRate / intervalSeconds.
+  sustainableRequestsPerSecond: number;
+}
+
 export interface ConfluenceClientOptions {
   baseUrl: string;
   pat: string;
-  // Optional observer notified once per 429-wave (when the cooldown was not
-  // already active). Used by the adaptive limiter to halve concurrency and
-  // honour Retry-After as a rate cap.
-  rateLimitObserver?: { report429: (retryAfterMs: number) => void };
+  // Notified once per 429-wave (when the cooldown was not already active).
+  // Used by the adaptive limiter to halve concurrency and honour Retry-After.
+  rateLimitObserver?: {
+    report429: (retryAfterMs: number) => void;
+    // Called on every successful response carrying X-RateLimit-* headers.
+    // Lets the limiter throttle *proactively* before we deplete the bucket.
+    reportBudget?: (budget: RateLimitBudget) => void;
+  };
 }
 
 export interface PageVersion {
@@ -81,6 +94,30 @@ export class ConfluenceClient {
     this.rateLimitObserver = opts.rateLimitObserver;
   }
 
+  // Snag X-RateLimit-* headers from a response and forward to the observer.
+  // Confluence Server/DC docs:
+  //   X-RateLimit-Limit          — bucket capacity
+  //   X-RateLimit-Remaining      — tokens available right now
+  //   X-RateLimit-Interval-Seconds — refill interval
+  //   X-RateLimit-FillRate       — tokens granted per interval
+  // Sustainable rate = FillRate / Interval seconds requests per second.
+  private notifyBudget(headers: Headers): void {
+    if (!this.rateLimitObserver?.reportBudget) return;
+    const limit = Number(headers.get('X-RateLimit-Limit'));
+    const remaining = Number(headers.get('X-RateLimit-Remaining'));
+    const intervalSeconds = Number(headers.get('X-RateLimit-Interval-Seconds'));
+    const fillRate = Number(headers.get('X-RateLimit-FillRate'));
+    if ([limit, remaining, intervalSeconds, fillRate].some((n) => Number.isNaN(n))) return;
+    if (intervalSeconds <= 0) return;
+    this.rateLimitObserver.reportBudget({
+      limit,
+      remaining,
+      intervalSeconds,
+      fillRate,
+      sustainableRequestsPerSecond: fillRate / intervalSeconds,
+    });
+  }
+
   // Parse a Retry-After header. Confluence returns either a seconds count or
   // an HTTP-date; both are valid per RFC 7231. Cap the result at 60s so a
   // misbehaving server can't strand us for hours.
@@ -112,6 +149,10 @@ export class ConfluenceClient {
       }
       const res = await fetch(url, init);
       if (res.status !== 429 && res.status !== 503) {
+        // Confluence sends X-RateLimit-* headers on EVERY authenticated
+        // response. Snag them so the limiter can throttle proactively before
+        // we deplete the bucket and trigger an actual 429.
+        this.notifyBudget(res.headers);
         if (backedOff && res.ok) {
           this.requestsRecoveredAfterBackoff++;
           log.info(

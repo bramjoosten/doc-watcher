@@ -1,4 +1,5 @@
-// Adaptive bounded-concurrency limiter with slow-start + Retry-After rate cap.
+// Adaptive bounded-concurrency limiter with slow-start, Retry-After rate cap,
+// and proactive budget-aware throttling.
 //
 // Replaces a fixed p-limit during real sync. Behaviour:
 //  - Starts at capacity = 1 (slow-start) and doubles every N successful runs
@@ -10,9 +11,19 @@
 //  - When a 429 carries a Retry-After hint, that interval becomes a
 //    *minimum inter-request spacing*: new requests can't fire until then.
 //    Future 429s extend the window; otherwise it elapses naturally.
+//  - PROACTIVE: Confluence returns X-RateLimit-* headers on every authenticated
+//    response. When `remaining/limit` drops below 20%, we add inter-request
+//    spacing equal to the sustainable refill interval; below 5%, we pause
+//    long enough for one token to refill. Goal: avoid hitting 429 in the
+//    first place rather than reacting after the fact.
 //
 // Bench is intentionally NOT using this — bench wants to measure absolute
 // burst tolerance at a fixed concurrency. Only the real sync benefits.
+
+import { log } from './log.js';
+
+const LOW_BUDGET_RATIO = 0.2;
+const CRITICAL_BUDGET_RATIO = 0.05;
 
 const DEFAULT_BUMP_EVERY_SUCCESSES = 50;
 
@@ -76,6 +87,42 @@ export class AdaptiveLimiter {
     this.capacity = Math.max(1, Math.floor(this.capacity / 2));
     if (retryAfterMs && retryAfterMs > 0) {
       this.nextSendAtMs = Math.max(this.nextSendAtMs, Date.now() + retryAfterMs);
+    }
+  }
+
+  private firstBudgetLogged = false;
+
+  // Proactive throttle from X-RateLimit-* headers. Called on every successful
+  // response; cheap if the budget is healthy, defensive if it isn't.
+  reportBudget(budget: {
+    limit: number;
+    remaining: number;
+    intervalSeconds: number;
+    fillRate: number;
+  }): void {
+    if (budget.limit <= 0 || budget.fillRate <= 0) return;
+
+    if (!this.firstBudgetLogged) {
+      this.firstBudgetLogged = true;
+      const perSec = budget.fillRate / budget.intervalSeconds;
+      log.info(
+        { ...budget, sustainableRequestsPerSecond: perSec },
+        `server rate limit: ${budget.limit}-token bucket, fills at ${budget.fillRate}/${budget.intervalSeconds}s = ${perSec.toFixed(2)} req/s sustainable`,
+      );
+    }
+
+    const ratio = budget.remaining / budget.limit;
+    if (ratio > LOW_BUDGET_RATIO) return; // healthy — let normal limits apply
+
+    // Time to refill one token, in ms.
+    const refillMs = (budget.intervalSeconds * 1000) / budget.fillRate;
+
+    if (ratio <= CRITICAL_BUDGET_RATIO) {
+      // Bucket nearly empty — pause long enough to refill at least one token.
+      this.nextSendAtMs = Math.max(this.nextSendAtMs, Date.now() + refillMs);
+    } else {
+      // Low but not critical — pace new requests at the sustainable rate.
+      this.nextSendAtMs = Math.max(this.nextSendAtMs, Date.now() + refillMs / 2);
     }
   }
 
