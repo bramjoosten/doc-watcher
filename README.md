@@ -46,7 +46,8 @@ The local tree mirrors Confluence; each page's id is appended after `--` so titl
 
 ```
 docs/
-  .state.json                         # state, page metadata, link resolution (hidden)
+  index-team-foo--12345.json          # one per configured root id; carries page metadata
+  index-team-bar--67890.json          # for that subtree
   ENG/
     _index.html / _index.md
     onboarding--67890/
@@ -56,7 +57,7 @@ docs/
     attachments/67890/diagram.png
 ```
 
-The `.md` has no YAML frontmatter — just the page body, prefixed with a one-line autolink back to the Confluence source so anyone reading the file knows where it came from. All structured metadata (id, version, ancestors, links, embeds) lives in `<output_dir>/.state.json`.
+The `.md` has no YAML frontmatter — just the page body, prefixed with a one-line autolink back to the Confluence source so anyone reading the file knows where it came from. All structured metadata (id, version, ancestors, links, embeds) lives in `<output_dir>/index-<slug>--<root_id>.json` — one index per configured root.
 
 ## Limitations
 

@@ -236,7 +236,7 @@ export async function downloadPages(pages: ConfluencePage[], opts: DownloadOptio
           opts.knownPagePaths.set(detailed.id, result.relPath);
           opts.titleIndex.set(titleIndexKey(detailedSpace, detailed.title), detailed.id);
           // Keep the top-of-state counter up to date even mid-sync, so an
-          // interrupted run's state.json still reflects the true on-disk count.
+          // interrupted run's per-root index file still reflects the true count.
           opts.state.total_pages_downloaded = Object.keys(opts.state.pages).length;
 
           if (written.length % PROGRESS_EVERY === 0) {
@@ -246,7 +246,7 @@ export async function downloadPages(pages: ConfluencePage[], opts: DownloadOptio
             );
           }
           // Persist after every successful page so an interrupt is recoverable.
-          // writeState is atomic (.tmp + rename); concurrent calls just clobber
+          // writeIndex is atomic (.tmp + rename); concurrent calls just clobber
           // each other's renames, which is fine — they all write the same in-memory
           // state object's current snapshot.
           if (opts.flushState) {

@@ -33,9 +33,11 @@ Node.js, TypeScript, run via `tsx`.
 
 ### State: plain JSON, not frontmatter
 
-The `.md` files have **no YAML frontmatter** — they're plain prose, easier for grep, editors, and LLMs to consume. All structural metadata (Confluence ID, version, ancestors, last-modified, links, embeds) lives in `<output_dir>/.state.json` (the state file sits inside the docs directory, hidden by the leading dot), with one entry per page keyed by Confluence ID. The state file is the source of truth for change detection and link resolution; the on-disk tree is the human-facing view derived from it. Writes are atomic via `tmp` + `rename` — interrupted runs never leave a half-written state file.
+The `.md` files have **no YAML frontmatter** — they're plain prose, easier for grep, editors, and LLMs to consume. All structural metadata (Confluence ID, version, ancestors, last-modified, links, embeds) lives in **per-root index files** at `<output_dir>/index-<slug>--<root_id>.json` — one per entry in `root_page_ids`. Each index covers the pages in its own subtree; the indexes are independent on disk but the resolver maps that link pages to local paths are merged across indexes at runtime so cross-root `ac:link` references still resolve. Writes are atomic via `tmp` + `rename` — interrupted runs never leave a half-written index file.
 
-The top of the JSON carries two human-facing counters — `total_watched_pages_on_remote` (what Confluence reported in the last sync's CQL window) and `total_pages_downloaded` (current size of the `pages` map). They're updated incrementally as each page is written so an interrupted run leaves them in sync with what's actually on disk. The huge `pages` map sits below; the counters at the top mean opening `state.json` shows a sanity-check view without parsing.
+The top of each index carries identification and counters — `root_page_id`, `root_title`, `total_watched_pages_on_remote` (what Confluence reported in the last sync's CQL window), `total_pages_downloaded` (current size of the `pages` map), and the `last_sync` / `last_full_enumeration` timestamps. Counters are updated incrementally as each page is written, so an interrupted run leaves them in sync with what's actually on disk. The bulk `pages` map sits below.
+
+Filename uses `--<root_id>` as the durable anchor — a root-title change just renames the file but leaves the index discoverable by id. Discovery is by glob (`index-*--<root_id>.json`); whoever owns the index wins.
 
 State is **flushed after every successful page write** during a sync, not just at the end. So an interrupt (Ctrl+C, crash, network failure) leaves the state file reflecting exactly the pages already on disk. The next `npm start` re-queries the same CQL window (last_sync doesn't advance until the sync completes), diffs against the persisted per-page versions, and only fetches the pages not yet recorded. Resume is automatic — no `--resume` flag, no special verb.
 
@@ -73,7 +75,8 @@ doc-watcher/
 
 ```
 docs/
-  .state.json                             # state + structural metadata (hidden)
+  index-team-foo--12345.json              # per-root index for root id 12345
+  index-team-bar--67890.json              # per-root index for root id 67890
   ENG/                                    # space key
     _index.html / _index.md               # space homepage
     onboarding--67890/                    # parent page → folder; ID after `--`

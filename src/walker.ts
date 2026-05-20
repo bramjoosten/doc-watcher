@@ -1,10 +1,5 @@
 import type { WatchEntry } from './config.js';
 
-export interface WalkScope {
-  watch: WatchEntry;
-  cql: string;
-}
-
 // Format a JS ISO timestamp into the shape Confluence Server CQL reliably
 // accepts: "yyyy-MM-dd HH:mm" — no T, no seconds, no ms, no Z. Server CQL
 // interprets the value in the server's local timezone, so we back-shift by
@@ -29,6 +24,3 @@ export function buildCQL(watch: WatchEntry, sinceIso?: string): string {
   return base;
 }
 
-export function planScopes(watches: WatchEntry[], sinceIso?: string): WalkScope[] {
-  return watches.map((w) => ({ watch: w, cql: buildCQL(w, sinceIso) }));
-}

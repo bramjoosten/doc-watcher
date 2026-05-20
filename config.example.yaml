@@ -11,8 +11,10 @@ base_url: https://confluence.example.com
 pat: ""
 
 # Where the mirrored docs go. Both the .html / .md pair for each page and the
-# tooling's own state file (.state.json) live inside this directory, so
-# moving or backing up `docs/` carries everything with it.
+# per-root index files (`index-<title>--<id>.json`) live inside this directory,
+# so moving or backing up the folder carries everything with it. Accepts an
+# absolute path, `~`-prefixed home-relative path, or a path relative to the
+# project working directory.
 output_dir: ./docs
 
 # Inline images referenced via ac:image macros. Set to true once you've gauged

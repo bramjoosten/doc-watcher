@@ -1,7 +1,16 @@
 import { readFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
+
+// `~` is a shell construct; Node doesn't expand it. Doing it manually so users
+// can put `output_dir: ~/my-confluence-docs` in config.yaml without surprise.
+function expandTilde(p: string): string {
+  if (p === '~') return homedir();
+  if (p.startsWith('~/')) return `${homedir()}${p.slice(1)}`;
+  return p;
+}
 
 // Flat schema — every setting lives at the top level. `root_page_ids` accepts
 // either a single string or an array of strings; each is the id of a
@@ -9,7 +18,7 @@ import { z } from 'zod';
 export const configSchema = z.object({
   base_url: z.string().url(),
   pat: z.string().min(1, 'pat is required — paste your Confluence PAT'),
-  output_dir: z.string().default('./docs'),
+  output_dir: z.string().default('./docs').transform(expandTilde),
   // Missing/undefined = "needs autotune". `npm start` runs the autotune on
   // startup when this is unset, and writes the chosen value back here.
   parallel_downloads: z.number().int().positive().optional(),

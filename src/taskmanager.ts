@@ -4,9 +4,9 @@
 import './disable-tls-check.js';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { pLimit } from './limit.js';
-import { loadConfig, type WatchEntry } from './config.js';
+import { loadConfig } from './config.js';
 import { ConfluenceClient } from './confluence.js';
 import { convertStorageFormat } from './converter.js';
 import {
@@ -19,8 +19,15 @@ import {
 } from './downloader.js';
 import { log } from './log.js';
 import { htmlPathFor } from './pathing.js';
-import { emptyState, readState, writeState } from './state.js';
-import { planScopes } from './walker.js';
+import {
+  emptyState,
+  findExistingIndexFile,
+  indexFileName,
+  readIndex,
+  type StateFile,
+  writeIndex,
+} from './state.js';
+import { buildCQL } from './walker.js';
 
 const BENCH_SAMPLE_SIZE = 30;
 // Dropped 50 — even when bench's 30-request burst tolerates it, sustained
@@ -34,10 +41,6 @@ const FULL_ENUMERATION_INTERVAL_MS = 24 * 60 * 60 * 1000;
 // end so the bench's decision is restated alongside the sync summary instead
 // of being scrolled off the top by all the per-page progress lines.
 let lastBenchReport: string[] | null = null;
-
-function buildFullEnumerationCQL(watch: WatchEntry): string {
-  return `(id = ${watch} OR ancestor = ${watch}) AND type = page`;
-}
 
 async function ensureTuned(): Promise<void> {
   const { config } = await loadConfig();
@@ -56,233 +59,267 @@ async function ensureTuned(): Promise<void> {
   }
 }
 
+// One root being synced. Each root has its own index file on disk.
+interface RootContext {
+  rootId: string;
+  title: string;
+  indexPath: string;
+  state: StateFile;
+}
+
+async function resolveRoot(
+  outputDir: string,
+  rootId: string,
+  client: ConfluenceClient,
+  fresh: boolean,
+): Promise<RootContext> {
+  if (fresh) {
+    // refresh wipes per-root state — fetch a current title so the filename is fresh.
+    const page = await client.getPage(rootId, ['version']);
+    const title = page.title;
+    return {
+      rootId,
+      title,
+      indexPath: join(outputDir, indexFileName(rootId, title)),
+      state: emptyState(rootId, title),
+    };
+  }
+  const existing = await findExistingIndexFile(outputDir, rootId);
+  if (existing) {
+    const state = await readIndex(existing, rootId, '(unknown)');
+    return { rootId, title: state.root_title, indexPath: existing, state };
+  }
+  // No prior index for this root — fetch the title once so we can name the file.
+  const page = await client.getPage(rootId, ['version']);
+  const title = page.title;
+  return {
+    rootId,
+    title,
+    indexPath: join(outputDir, indexFileName(rootId, title)),
+    state: emptyState(rootId, title),
+  };
+}
+
 async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }): Promise<void> {
   await ensureTuned();
   const { config, rootDir } = await loadConfig();
   const outputDir = resolve(rootDir, config.output_dir);
   await mkdir(outputDir, { recursive: true });
 
-  const state = opts.full ? emptyState() : await readState(outputDir);
-  const localCount = Object.keys(state.pages).length;
-  log.info(
-    { localCount, lastSync: state.last_sync ?? '(none)', full: opts.full },
-    `state loaded — ${localCount} pages already on disk; last_sync=${state.last_sync ?? '(none)'}`,
-  );
+  // Migration: warn once if we find the old one-file layout. The new per-root
+  // indexes won't see it, so the user would otherwise wonder why their existing
+  // state seems to have vanished.
+  const oldStatePath = resolve(outputDir, '.state.json');
+  if (existsSync(oldStatePath)) {
+    log.warn(
+      { oldStatePath },
+      `found legacy .state.json from before per-root indexes — ignored. Run \`npm start -- refresh\` to rebuild as per-root index files, then delete .state.json.`,
+    );
+  }
 
   const client = new ConfluenceClient({
     baseUrl: config.base_url,
     pat: config.pat,
   });
 
-  const since = opts.full ? undefined : state.last_sync ?? undefined;
-  const scopes = planScopes(config.root_page_ids, since);
-  log.info({ scopes: scopes.map((s) => s.cql), full: opts.full }, 'planned scopes');
-
-  const seen = new Map<string, Awaited<ReturnType<typeof client.searchByCQL>>[number]>();
-  for (const scope of scopes) {
-    const results = await client.searchByCQL(scope.cql, ['version', 'space', 'ancestors']);
-    for (const r of results) seen.set(r.id, r);
+  // Load (or initialise) one index per configured root.
+  const roots: RootContext[] = [];
+  for (const rootId of config.root_page_ids) {
+    roots.push(await resolveRoot(outputDir, rootId, client, opts.full));
   }
+  const totalLocal = roots.reduce((acc, r) => acc + Object.keys(r.state.pages).length, 0);
+  log.info(
+    {
+      roots: roots.map((r) => ({
+        id: r.rootId,
+        title: r.title,
+        pages: Object.keys(r.state.pages).length,
+        last_sync: r.state.last_sync,
+      })),
+    },
+    `loaded ${roots.length} root index file(s) — ${totalLocal} pages already on disk`,
+  );
 
-  // Determine which ids have children so we can emit folder + _index.md.
-  const pagesWithChildren = new Set<string>();
-  for (const page of seen.values()) {
-    for (const a of page.ancestors ?? []) pagesWithChildren.add(a.id);
-  }
-
-  // The configured root ids — used by pickPageRelPath to trim ancestor folders
+  // Configured root ids — used by pickPageRelPath to trim ancestor folders
   // above the root so the on-disk tree starts where the user said to.
   const rootPageIds = new Set(config.root_page_ids);
 
+  // Maps shared across all roots so cross-root ac:link references resolve
+  // to a local path. Seed from existing state on every root, then per-root
+  // sync overlays this run's data.
   const knownPagePaths = new Map<string, string>();
-  for (const [id, st] of Object.entries(state.pages)) knownPagePaths.set(id, st.path);
-  for (const page of seen.values()) {
-    knownPagePaths.set(page.id, pickPageRelPath(page, pagesWithChildren, rootPageIds));
-  }
-
-  // Title→id map keyed by `${spaceKey}::${title}`. Seed from state (unchanged pages from
-  // prior runs) then overlay this run's results so renames win.
   const titleIndex = new Map<string, string>();
-  for (const [id, st] of Object.entries(state.pages)) {
-    if (st.space && st.title) titleIndex.set(titleIndexKey(st.space, st.title), id);
+  for (const r of roots) {
+    for (const [id, st] of Object.entries(r.state.pages)) {
+      knownPagePaths.set(id, st.path);
+      if (st.space && st.title) titleIndex.set(titleIndexKey(st.space, st.title), id);
+    }
   }
-  for (const page of seen.values()) {
-    const sp = page.space?.key;
-    if (sp) titleIndex.set(titleIndexKey(sp, page.title), page.id);
-  }
 
-  const remaining = [...seen.values()].filter((p) => {
-    const prev = state.pages[p.id];
-    return !prev || prev.version !== (p.version?.number ?? 0);
-  });
-
-  // Split the work into new vs. updated for the post-sync summary.
-  const newPageIds = new Set(remaining.filter((p) => !state.pages[p.id]).map((p) => p.id));
-  const updatedPageIds = new Set(remaining.filter((p) => state.pages[p.id]).map((p) => p.id));
-
-  // Keep the top-of-state counters fresh on every sync iteration. Both are
-  // also re-computed before the final writeState, but flushing them here means
-  // a per-page mid-sync state.json already shows current numbers.
-  state.total_watched_pages_on_remote = seen.size;
-  state.total_pages_downloaded = Object.keys(state.pages).length;
-
-  log.info(
-    { candidates: seen.size, remaining: remaining.length, new: newPageIds.size, updated: updatedPageIds.size },
-    'sync diff',
-  );
-
+  // Per-root sync, accumulating numbers for the cross-root summary at the end.
   const syncIso = new Date().toISOString();
-  const result = await downloadPages(
-    remaining,
-    {
-      config,
-      client,
-      outputDir,
-      state,
-      knownPagePaths,
-      pagesWithChildren,
-      titleIndex,
-      rootPageIds,
-      // Flush after every successful page so an interrupt is resumable.
-      // `last_sync` stays at its previous value until the end of this run,
-      // so on resume the same CQL diff is re-issued; pages already in state
-      // are skipped via the version check.
-      flushState: () => writeState(outputDir, state),
-    },
-    syncIso,
-  );
+  let allAdded = 0;
+  let allUpdated = 0;
+  let allDeleted = 0;
+  let allDownloaded = 0;
+  let allCandidates = 0;
+  let allSkipped = 0;
+  let allAttachments = 0;
+  let allErrors = 0;
+  const allErrorSummary: Record<string, number> = {};
 
-  // Decide whether to run a full enumeration for delete reconciliation. Three triggers:
-  //   - explicit refresh (opts.full)
-  //   - first run (no prior last_sync)
-  //   - daily cadence: last_full_enumeration is null or older than 24h
-  //   - --force-full-enumeration on this invocation
-  const lastFull = state.last_full_enumeration ? Date.parse(state.last_full_enumeration) : NaN;
-  const daily = Number.isNaN(lastFull) || Date.now() - lastFull > FULL_ENUMERATION_INTERVAL_MS;
-  const doFullEnumeration = opts.full || since === undefined || opts.forceFullEnumeration === true || daily;
+  for (const root of roots) {
+    const since = opts.full ? undefined : root.state.last_sync ?? undefined;
+    const cql = buildCQL(root.rootId, since);
+    log.info({ rootId: root.rootId, title: root.title, cql }, `syncing root "${root.title}" (${root.rootId})`);
 
-  let deletedCount = 0;
-  if (doFullEnumeration) {
-    let allIds: Set<string>;
-    if (opts.full || since === undefined) {
-      // The incremental query already had no `lastmodified` clause in this case, so `seen` is full.
-      allIds = new Set(seen.keys());
-    } else {
-      const fullSeen = new Set<string>();
-      for (const watch of config.root_page_ids) {
-        const cql = buildFullEnumerationCQL(watch);
-        const results = await client.searchByCQL(cql, ['version']);
-        for (const r of results) fullSeen.add(r.id);
-      }
-      allIds = fullSeen;
-      log.info({ count: allIds.size }, `daily full page-list refresh done (${allIds.size} pages on Confluence)`);
+    const results = await client.searchByCQL(cql, ['version', 'space', 'ancestors']);
+    const seen = new Map<string, (typeof results)[number]>();
+    for (const r of results) seen.set(r.id, r);
+
+    const pagesWithChildren = new Set<string>();
+    for (const page of seen.values()) for (const a of page.ancestors ?? []) pagesWithChildren.add(a.id);
+
+    for (const page of seen.values()) {
+      knownPagePaths.set(page.id, pickPageRelPath(page, pagesWithChildren, rootPageIds));
+      const sp = page.space?.key;
+      if (sp) titleIndex.set(titleIndexKey(sp, page.title), page.id);
     }
 
-    const toDelete = Object.keys(state.pages).filter((id) => !allIds.has(id));
-    deletedCount = toDelete.length;
-    for (const id of toDelete) {
-      const st = state.pages[id];
-      if (!st) continue;
-      const abs = resolve(outputDir, st.path);
-      try {
-        await rm(abs, { force: true });
-        log.info({ id, path: st.path }, 'deleted orphan');
-      } catch (err) {
-        log.warn({ err, id }, 'orphan delete failed');
-      }
-      delete state.pages[id];
-    }
-    state.last_full_enumeration = syncIso;
-  }
+    const remaining = [...seen.values()].filter((p) => {
+      const prev = root.state.pages[p.id];
+      return !prev || prev.version !== (p.version?.number ?? 0);
+    });
+    const newPageIds = new Set(remaining.filter((p) => !root.state.pages[p.id]).map((p) => p.id));
+    const updatedPageIds = new Set(remaining.filter((p) => root.state.pages[p.id]).map((p) => p.id));
 
-  // Only advance last_sync on a fully successful run. If any page failed,
-  // keep last_sync where it was so the next CQL window still includes the
-  // failed pages — their missing state.pages entries will pull them back
-  // into remaining via the version diff. Successful pages have matching
-  // versions in state and are skipped, so the cost is just re-running the
-  // CQL search, not re-downloading completed pages.
-  if (result.errors.length === 0) {
-    state.last_sync = syncIso;
-  } else {
-    log.warn(
-      { errors: result.errors.length, lastSyncFrozen: state.last_sync ?? '(none)' },
-      `last_sync NOT advanced because ${result.errors.length} page(s) failed; they'll be retried on the next run`,
+    root.state.total_watched_pages_on_remote = seen.size;
+    root.state.total_pages_downloaded = Object.keys(root.state.pages).length;
+    log.info(
+      { rootId: root.rootId, candidates: seen.size, remaining: remaining.length, new: newPageIds.size, updated: updatedPageIds.size },
+      `${root.title}: ${seen.size} pages on remote; ${remaining.length} need fetching`,
     );
+
+    const result = await downloadPages(
+      remaining,
+      {
+        config,
+        client,
+        outputDir,
+        state: root.state,
+        knownPagePaths,
+        pagesWithChildren,
+        titleIndex,
+        rootPageIds,
+        flushState: () => writeIndex(root.indexPath, root.state),
+      },
+      syncIso,
+    );
+
+    // Delete reconciliation (per root)
+    const lastFull = root.state.last_full_enumeration ? Date.parse(root.state.last_full_enumeration) : NaN;
+    const daily = Number.isNaN(lastFull) || Date.now() - lastFull > FULL_ENUMERATION_INTERVAL_MS;
+    const doFullEnumeration = opts.full || since === undefined || opts.forceFullEnumeration === true || daily;
+
+    let deletedCount = 0;
+    if (doFullEnumeration) {
+      let allIds: Set<string>;
+      if (opts.full || since === undefined) {
+        allIds = new Set(seen.keys());
+      } else {
+        const fullSeen = new Set<string>();
+        const fullCql = buildCQL(root.rootId);
+        const fullResults = await client.searchByCQL(fullCql, ['version']);
+        for (const r of fullResults) fullSeen.add(r.id);
+        allIds = fullSeen;
+        log.info({ rootId: root.rootId, count: allIds.size }, `${root.title}: daily full page-list refresh done (${allIds.size} on remote)`);
+      }
+      const toDelete = Object.keys(root.state.pages).filter((id) => !allIds.has(id));
+      deletedCount = toDelete.length;
+      for (const id of toDelete) {
+        const st = root.state.pages[id];
+        if (!st) continue;
+        const abs = resolve(outputDir, st.path);
+        try {
+          await rm(abs, { force: true });
+          log.info({ rootId: root.rootId, id, path: st.path }, 'deleted orphan');
+        } catch (err) {
+          log.warn({ rootId: root.rootId, err, id }, 'orphan delete failed');
+        }
+        delete root.state.pages[id];
+      }
+      root.state.last_full_enumeration = syncIso;
+    }
+
+    if (result.errors.length === 0) {
+      root.state.last_sync = syncIso;
+    } else {
+      log.warn(
+        { rootId: root.rootId, errors: result.errors.length, lastSyncFrozen: root.state.last_sync ?? '(none)' },
+        `${root.title}: last_sync NOT advanced because ${result.errors.length} page(s) failed; they'll be retried next run`,
+      );
+    }
+    root.state.total_pages_downloaded = Object.keys(root.state.pages).length;
+    await writeIndex(root.indexPath, root.state);
+
+    // Per-root attribution + accumulate into totals.
+    const writtenSet = new Set(result.written);
+    const succeededIds = new Set<string>();
+    for (const [id, st] of Object.entries(root.state.pages)) {
+      if (writtenSet.has(st.path)) succeededIds.add(id);
+    }
+    const addedCount = [...newPageIds].filter((id) => succeededIds.has(id)).length;
+    const updatedCount = [...updatedPageIds].filter((id) => succeededIds.has(id)).length;
+
+    for (const e of result.errors) {
+      const msg = e.error instanceof Error ? e.error.message : String(e.error);
+      const code = /\b(40\d|41\d|42\d|43\d|44\d|5\d\d)\b/.exec(msg)?.[1] ?? 'other';
+      allErrorSummary[code] = (allErrorSummary[code] ?? 0) + 1;
+    }
+
+    allCandidates += seen.size;
+    allSkipped += seen.size - remaining.length;
+    allDownloaded += result.written.length;
+    allAttachments += result.attachments.length;
+    allErrors += result.errors.length;
+    allAdded += addedCount;
+    allUpdated += updatedCount;
+    allDeleted += deletedCount;
   }
-  state.total_pages_downloaded = Object.keys(state.pages).length;
-  await writeState(outputDir, state);
 
-  // Count how much of remaining landed successfully, split by new vs updated.
-  const writtenSet = new Set(result.written);
-  // result.written is relPaths, not ids. Cross-reference via state.pages.
-  // Simpler: derive succeeded-by-id from state.pages updates within remaining.
-  // After downloadPages, every page it successfully wrote was inserted into
-  // state.pages with its new version. We compare against the per-id sets.
-  // But remaining's "new" entries didn't exist before, so a successful write
-  // is detectable by state.pages[id] being present. Updated entries already
-  // existed but got their version bumped — also detectable.
-  // We didn't capture the pre-fetch versions for `updated` though. Instead,
-  // attribute by ids: successful = ids whose path now matches result.written,
-  // and split by membership in newPageIds / updatedPageIds.
-  const succeededIds = new Set<string>();
-  for (const [id, st] of Object.entries(state.pages)) {
-    if (writtenSet.has(st.path)) succeededIds.add(id);
-  }
-  const addedCount = [...newPageIds].filter((id) => succeededIds.has(id)).length;
-  const updatedCount = [...updatedPageIds].filter((id) => succeededIds.has(id)).length;
-  const totalChanges = addedCount + updatedCount + deletedCount;
-  const isFirstSync = since === undefined;
+  // Aggregate headline across all roots.
+  const totalChanges = allAdded + allUpdated + allDeleted;
+  const parts: string[] = [];
+  if (allAdded > 0) parts.push(`${allAdded} new`);
+  if (allUpdated > 0) parts.push(`${allUpdated} updated`);
+  if (allDeleted > 0) parts.push(`${allDeleted} deleted`);
+  const breakdown = parts.length > 0 ? ` (${parts.join(', ')})` : '';
+  const skippedNote = allSkipped > 0 ? `; ${allSkipped} skipped (already up to date)` : '';
 
-  // Bucket errors by HTTP status so a sea of failures shows its shape.
-  const errorSummary: Record<string, number> = {};
-  for (const e of result.errors) {
-    const msg = e.error instanceof Error ? e.error.message : String(e.error);
-    const code = /\b(40\d|41\d|42\d|43\d|44\d|5\d\d)\b/.exec(msg)?.[1] ?? 'other';
-    errorSummary[code] = (errorSummary[code] ?? 0) + 1;
-  }
-
-  // Out of `candidates` pages in the CQL window, `downloaded` were actually
-  // fetched this run; the rest were skipped because state already had them
-  // at the current version.
-  const candidates = seen.size;
-  const downloaded = result.written.length;
-  const skipped = candidates - remaining.length;
-
-  // Build a human-readable headline.
   let headline: string;
-  if (isFirstSync) {
-    headline = `initial sync complete — ${downloaded} of ${candidates} downloaded`;
-  } else if (totalChanges === 0 && result.errors.length === 0) {
-    headline = `no changes since your last run — 0 of ${candidates} downloaded (all ${skipped} already up to date)`;
+  if (totalChanges === 0 && allErrors === 0) {
+    headline = `no changes across ${roots.length} root(s) — 0 of ${allCandidates} downloaded (all ${allSkipped} already up to date)`;
   } else {
-    const parts: string[] = [];
-    if (addedCount > 0) parts.push(`${addedCount} new`);
-    if (updatedCount > 0) parts.push(`${updatedCount} updated`);
-    if (deletedCount > 0) parts.push(`${deletedCount} deleted`);
-    const breakdown = parts.length > 0 ? ` (${parts.join(', ')})` : '';
-    const skippedNote = skipped > 0 ? `; ${skipped} skipped (already up to date)` : '';
-    headline = `${totalChanges} change${totalChanges === 1 ? '' : 's'} since your last run${breakdown} — ${downloaded} of ${candidates} downloaded${skippedNote}`;
+    headline = `${totalChanges} change${totalChanges === 1 ? '' : 's'} across ${roots.length} root(s)${breakdown} — ${allDownloaded} of ${allCandidates} downloaded${skippedNote}`;
   }
-  if (result.errors.length > 0) {
-    const errParts = Object.entries(errorSummary).map(([k, v]) => `${k}=${v}`).join(', ');
-    headline += `. ${result.errors.length} error${result.errors.length === 1 ? '' : 's'} (${errParts}) — re-run \`npm start\` to retry; successful pages are skipped.`;
+  if (allErrors > 0) {
+    const errParts = Object.entries(allErrorSummary).map(([k, v]) => `${k}=${v}`).join(', ');
+    headline += `. ${allErrors} error${allErrors === 1 ? '' : 's'} (${errParts}) — re-run \`npm start\` to retry.`;
   }
 
   log.info(
     {
-      added: addedCount,
-      updated: updatedCount,
-      deleted: deletedCount,
-      attachments: result.attachments.length,
-      errors: result.errors.length,
-      ...(result.errors.length > 0 ? { errorSummary } : {}),
+      added: allAdded,
+      updated: allUpdated,
+      deleted: allDeleted,
+      attachments: allAttachments,
+      errors: allErrors,
+      ...(allErrors > 0 ? { errorSummary: allErrorSummary } : {}),
     },
     headline,
   );
 
-  // If the autotune ran this turn, restate its decision here — the per-level
-  // and "bench winner" lines emitted at startup get pushed off the top of the
-  // tail by all the per-page progress lines, so we replay the recap.
+  // Bench recap if autotune ran this turn.
   if (lastBenchReport && lastBenchReport.length > 0) {
     const block = ['autotune ran this turn — recap:', ...lastBenchReport.map((l) => `  ${l}`)].join('\n');
     log.info(block);
@@ -313,7 +350,7 @@ async function runBench(): Promise<void> {
 
   // Collect a sample of page ids from the first root subtree. We stop after
   // BENCH_SAMPLE_SIZE so a 10k-page space costs one /search call, not the full sweep.
-  const cql = buildFullEnumerationCQL(firstScope);
+  const cql = buildCQL(firstScope);
   const params = new URLSearchParams();
   params.set('cql', cql);
   params.set('limit', '100');
@@ -453,24 +490,36 @@ async function runBench(): Promise<void> {
 async function runReconvert(): Promise<void> {
   const { config, rootDir } = await loadConfig();
   const outputDir = resolve(rootDir, config.output_dir);
-  const state = await readState(outputDir);
 
-  if (Object.keys(state.pages).length === 0) {
-    log.warn('state is empty; nothing to reconvert. Run `sync` or `refresh` first.');
+  // Load every per-root index, merging into one big map for the resolver.
+  // We don't need a client here — reconvert is network-free, working entirely
+  // from the saved .html files on disk plus the resolver maps in state.
+  const mergedPages: StateFile['pages'] = {};
+  const mergedKnown = new Map<string, string>();
+  const mergedTitle = new Map<string, string>();
+  for (const rootId of config.root_page_ids) {
+    const existing = await findExistingIndexFile(outputDir, rootId);
+    if (!existing) continue;
+    const state = await readIndex(existing, rootId, '(unknown)');
+    Object.assign(mergedPages, state.pages);
+    for (const [id, p] of Object.entries(state.pages)) {
+      mergedKnown.set(id, p.path);
+      if (p.space && p.title) mergedTitle.set(titleIndexKey(p.space, p.title), id);
+    }
+  }
+
+  const allPages = Object.entries(mergedPages);
+  if (allPages.length === 0) {
+    log.warn('no index files found; nothing to reconvert. Run `sync` or `refresh` first.');
     return;
   }
 
-  // Build the resolver maps the converter needs — no network.
-  const knownPagePaths = new Map<string, string>();
-  const titleIndex = new Map<string, string>();
-  for (const [id, p] of Object.entries(state.pages)) {
-    knownPagePaths.set(id, p.path);
-    if (p.space && p.title) titleIndex.set(titleIndexKey(p.space, p.title), id);
-  }
+  // Build a stub state for buildConvertOptions (only state.pages is read).
+  const stubState = { ...emptyState('', ''), pages: mergedPages };
 
   let processed = 0;
   let skipped = 0;
-  for (const [id, p] of Object.entries(state.pages)) {
+  for (const [id, p] of allPages) {
     const mdAbs = resolve(outputDir, p.path);
     const htmlAbs = htmlPathFor(mdAbs);
     let html: string;
@@ -491,9 +540,9 @@ async function runReconvert(): Promise<void> {
         pagePath: p.path,
         pageSpace: p.space,
         baseUrl: config.base_url,
-        state,
-        knownPagePaths,
-        titleIndex,
+        state: stubState,
+        knownPagePaths: mergedKnown,
+        titleIndex: mergedTitle,
       }),
     );
     const sourceUrl = sourceUrlFor(config.base_url, id);
