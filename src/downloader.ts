@@ -263,9 +263,13 @@ export async function downloadPages(pages: ConfluencePage[], opts: DownloadOptio
   const written: string[] = [];
   const attachments: string[] = [];
   const errors: { id: string; error: unknown }[] = [];
-  // Periodic progress: log every Nth successful page so the user knows the
-  // sync is making progress even when most output is just retry warnings.
-  const PROGRESS_EVERY = 100;
+  // Periodic progress: log every Nth successful page, AND at least every M
+  // seconds, whichever fires first. Heavy throttling can drop the success rate
+  // below 100/run, so a pure count threshold can leave the user staring at
+  // backoff warnings without any "yes we're making progress" feedback.
+  const PROGRESS_EVERY = 50;
+  const PROGRESS_INTERVAL_MS = 30_000;
+  let lastProgressAt = Date.now();
   const total = pages.length;
 
   await Promise.all(
@@ -294,11 +298,15 @@ export async function downloadPages(pages: ConfluencePage[], opts: DownloadOptio
           // interrupted run's per-root index file still reflects the true count.
           opts.state.total_pages_downloaded = Object.keys(opts.state.pages).length;
 
-          if (written.length % PROGRESS_EVERY === 0) {
+          const now = Date.now();
+          const hitCount = written.length % PROGRESS_EVERY === 0;
+          const hitTime = now - lastProgressAt >= PROGRESS_INTERVAL_MS;
+          if (hitCount || hitTime) {
             log.info(
               { downloaded: written.length, of: total, lastId: detailed.id, lastTitle: detailed.title },
               `progress: ${written.length} of ${total} downloaded (last: ${detailed.id} — ${detailed.title})`,
             );
+            lastProgressAt = now;
           }
           // Persist after every successful page so an interrupt is recoverable.
           // writeIndex is atomic (.tmp + rename); concurrent calls just clobber
