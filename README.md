@@ -28,7 +28,7 @@ npm start
 
 That's the daily-driver. With no args it runs an **incremental sync** — the first invocation does the bulk download (state is empty), every subsequent run only fetches pages that changed since the last sync. Then it exits. Run it again whenever you want fresh docs.
 
-The very first run also benchmarks download concurrency on a sample of pages and writes the chosen value into `config.yaml` under `sync.parallel_downloads`, so future runs reuse it. Comment out (or delete) that line to force a re-bench; edit it by hand to pin a specific value.
+Concurrency is managed by an adaptive limiter informed by Confluence's `X-RateLimit-*` headers — it starts at 1, ramps up toward `parallel_downloads` (default 20) when the server says there's budget, and throttles down before hitting 429. No autotune step needed; the `parallel_downloads` value in `config.yaml` is just an upper ceiling.
 
 **Resumable**: state is flushed after every successful page write. If you Ctrl+C mid-sync (or anything else interrupts the process), just run `npm start` again — already-downloaded pages are skipped via their stored version number, and the sync picks up where it left off.
 

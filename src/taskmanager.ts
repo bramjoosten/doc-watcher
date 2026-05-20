@@ -5,8 +5,6 @@ import './disable-tls-check.js';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { cpus } from 'node:os';
-import { pLimit } from './limit.js';
 import { AdaptiveLimiter } from './adaptive-limiter.js';
 import { loadConfig } from './config.js';
 import { ConfluenceClient } from './confluence.js';
@@ -35,35 +33,12 @@ import {
 } from './state.js';
 import { buildCQL } from './walker.js';
 
-const BENCH_SAMPLE_SIZE = 30;
-// Dropped 50 — even when bench's 30-request burst tolerates it, sustained
-// load over thousands of pages drains the server's token bucket and the
-// real sync hits cascading 429s.
-const BENCH_CONCURRENCY_LEVELS = [1, 2, 5, 10, 20];
-
 const FULL_ENUMERATION_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
-// Set by runBench when it completes; consumed (and cleared) by runSync at the
-// end so the bench's decision is restated alongside the sync summary instead
-// of being scrolled off the top by all the per-page progress lines.
-let lastBenchReport: string[] | null = null;
-
-async function ensureTuned(): Promise<void> {
-  const { config } = await loadConfig();
-  if (config.parallel_downloads && config.parallel_downloads > 0) {
-    log.info(
-      { parallel_downloads: config.parallel_downloads },
-      `using configured parallel_downloads = ${config.parallel_downloads}; skipping autotune`,
-    );
-    return;
-  }
-  log.info('parallel_downloads not set in config.yaml — running autotune (one-time)');
-  try {
-    await runBench();
-  } catch (err) {
-    log.warn({ err }, 'autotune failed; sync will fall back to a heuristic this run');
-  }
-}
+// Default cap when the user hasn't set parallel_downloads in config.yaml.
+// The adaptive limiter starts at 1 anyway and ramps based on observed
+// X-RateLimit-* headers, so this is just an upper ceiling, not a target.
+const DEFAULT_PARALLEL_DOWNLOADS = 20;
 
 // One root being synced. Each root has its own index file on disk.
 interface RootContext {
@@ -107,7 +82,6 @@ async function resolveRoot(
 }
 
 async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }): Promise<void> {
-  await ensureTuned();
   const { config, rootDir } = await loadConfig();
   const outputDir = resolve(rootDir, config.output_dir);
   await mkdir(outputDir, { recursive: true });
@@ -123,11 +97,11 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
     );
   }
 
-  // Cap derived from autotuned config or a CPU-based fallback. The adaptive
-  // limiter starts at 1 (slow-start), doubles every 50 successes up to this
-  // cap, halves on every 429, and honours Retry-After as a rate cap.
-  const parallelCap =
-    config.parallel_downloads ?? Math.min(50, Math.max(4, (cpus()?.length ?? 4) * 2));
+  // Cap from config (or a flat default). Adaptive limiter starts at 1
+  // (slow-start), doubles every 50 successes up to this cap, halves on every
+  // 429, honours Retry-After, and paces from X-RateLimit-* headers when the
+  // server's budget gets low.
+  const parallelCap = config.parallel_downloads ?? DEFAULT_PARALLEL_DOWNLOADS;
   const adaptiveLimiter = new AdaptiveLimiter({ max: parallelCap, slowStart: true });
   log.info(
     { maxConcurrency: parallelCap, startingConcurrency: adaptiveLimiter.currentCapacity },
@@ -373,173 +347,8 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
     `adaptive concurrency settled at ${adaptiveLimiter.currentCapacity} of ${adaptiveLimiter.maxCapacity} max`,
   );
 
-  // Bench recap if autotune ran this turn.
-  if (lastBenchReport && lastBenchReport.length > 0) {
-    const block = ['autotune ran this turn — recap:', ...lastBenchReport.map((l) => `  ${l}`)].join('\n');
-    log.info(block);
-    lastBenchReport = null;
-  }
 }
 
-async function runBench(): Promise<void> {
-  const { config, rootDir } = await loadConfig();
-  const firstScope = config.root_page_ids[0];
-  if (!firstScope) {
-    log.error('no root_page_ids configured; nothing to bench');
-    process.exitCode = 1;
-    return;
-  }
-
-  const configPath = resolve(rootDir, 'config.yaml');
-  if (!existsSync(configPath)) {
-    log.error({ configPath }, 'config.yaml not found; copy config.example.yaml to config.yaml first');
-    process.exitCode = 1;
-    return;
-  }
-
-  const client = new ConfluenceClient({
-    baseUrl: config.base_url,
-    pat: config.pat,
-  });
-
-  // Collect a sample of page ids from the first root subtree. We stop after
-  // BENCH_SAMPLE_SIZE so a 10k-page space costs one /search call, not the full sweep.
-  const cql = buildCQL(firstScope);
-  const params = new URLSearchParams();
-  params.set('cql', cql);
-  params.set('limit', '100');
-  params.set('expand', 'version');
-  const searchPath = `/rest/api/content/search?${params.toString()}`;
-
-  const sample: { id: string }[] = [];
-  for await (const item of client.paginate<{ id: string }>(searchPath)) {
-    sample.push(item);
-    if (sample.length >= BENCH_SAMPLE_SIZE) break;
-  }
-  if (sample.length === 0) {
-    log.error({ scope: firstScope }, 'no pages found under the first root_page_id; cannot bench');
-    process.exitCode = 1;
-    return;
-  }
-  log.info({ sampleSize: sample.length, levels: BENCH_CONCURRENCY_LEVELS }, 'bench starting');
-
-  interface BenchRow {
-    concurrency: number;
-    elapsedMs: number;
-    errors: number;
-    throughputPerSec: number;
-    firstError?: string;
-  }
-  const results: BenchRow[] = [];
-
-  const errToString = (err: unknown): string => {
-    if (err instanceof Error) return err.message;
-    try {
-      return String(err);
-    } catch {
-      return '(unprintable error)';
-    }
-  };
-
-  for (const c of BENCH_CONCURRENCY_LEVELS) {
-    const limiter = pLimit(c);
-    const start = Date.now();
-    let errors = 0;
-    let firstError: string | undefined;
-    await Promise.all(
-      sample.map((p) =>
-        limiter(async () => {
-          try {
-            // Bypass the client's 429/503 retry — bench needs to see the
-            // rate-limit cliff, not have it smoothed over.
-            await client.getPage(p.id, undefined, { retry: false });
-          } catch (err) {
-            errors++;
-            if (!firstError) firstError = errToString(err);
-          }
-        }),
-      ),
-    );
-    const elapsedMs = Date.now() - start;
-    const throughputPerSec = sample.length / (elapsedMs / 1000);
-    const rounded = Number(throughputPerSec.toFixed(2));
-    results.push({ concurrency: c, elapsedMs, errors, throughputPerSec: rounded, firstError });
-    log.info(
-      { concurrency: c, elapsedMs, errors, throughputPerSec: rounded, firstError },
-      `bench level done — parallel_downloads = ${c} → ${rounded} pages/s` +
-        (errors > 0 ? ` (${errors} error(s); first: ${firstError ?? '?'})` : ''),
-    );
-    if (errors > 0) {
-      log.warn({ concurrency: c, errors, firstError }, 'errors at this level; stopping sweep');
-      break;
-    }
-  }
-
-  const candidates = results.filter((r) => r.errors === 0);
-  if (candidates.length === 0) {
-    const errored = results.find((r) => r.errors > 0);
-    log.error(
-      { results, firstError: errored?.firstError },
-      `every concurrency level produced errors. First error seen: ${errored?.firstError ?? '(none captured)'}. ` +
-        `Common causes: 403 = PAT lacks read access to one of the sample pages; ` +
-        `429/503 = server is hard-throttling (try again later, or set parallel_downloads = 1 manually); ` +
-        `4xx other = malformed request (bug, report it). Not writing config.`,
-    );
-    process.exitCode = 1;
-    return;
-  }
-  const peak = candidates.reduce((a, b) => (b.throughputPerSec > a.throughputPerSec ? b : a));
-  // Step TWO tiers down from the peak for headroom. Bench measures *burst*
-  // tolerance on 30 pages; a full sync sustains the load over thousands of
-  // pages, and the server's token bucket only drains under sustained
-  // pressure. One tier proved too aggressive in practice (cascading 429
-  // storms mid-sync); two tiers trades more throughput for much higher
-  // reliability. Users who need speed can pin a higher value manually.
-  const peakIdx = BENCH_CONCURRENCY_LEVELS.indexOf(peak.concurrency);
-  const safeIdx = Math.max(0, peakIdx - 2);
-  const safeLevel = BENCH_CONCURRENCY_LEVELS[safeIdx]!;
-  const best = candidates.find((r) => r.concurrency === safeLevel) ?? peak;
-  log.info(
-    {
-      peakConcurrency: peak.concurrency,
-      peakThroughputPerSec: peak.throughputPerSec,
-      chosenConcurrency: best.concurrency,
-    },
-    `bench: peak was parallel_downloads = ${peak.concurrency} (${peak.throughputPerSec} pages/s); ` +
-      `picking ${best.concurrency} (two tiers down) for sustained-load headroom`,
-  );
-
-  // Flat YAML: find any existing parallel_downloads line (commented or not)
-  // at column 0 and rewrite it. Append at end of file if there's no such line.
-  const text = await readFile(configPath, 'utf8');
-  const lineRe = /^#?[ \t]*parallel_downloads[ \t]*:[ \t]*\d+[^\n]*$/m;
-  const newLine = `parallel_downloads: ${best.concurrency}`;
-
-  const updated = lineRe.test(text)
-    ? text.replace(lineRe, newLine)
-    : `${text.replace(/\n+$/, '')}\n${newLine}\n`;
-
-  await writeFile(configPath, updated, 'utf8');
-  log.info(
-    { configPath, value: best.concurrency },
-    `wrote parallel_downloads: ${best.concurrency} to config.yaml`,
-  );
-
-  // Build a recap that runSync will print at the end of its run. It restates
-  // the per-level results, the peak, the safety margin, and the chosen value
-  // so the decision is right next to the sync summary, not buried at the top.
-  lastBenchReport = [
-    `sample size: ${BENCH_SAMPLE_SIZE} pages from root_page_id ${firstScope}`,
-    ...results.map(
-      (r) =>
-        `  level ${r.concurrency.toString().padStart(2)}: ${r.throughputPerSec.toFixed(2)} pages/s` +
-        (r.errors > 0 ? ` — ${r.errors} error(s)${r.firstError ? ` (first: ${r.firstError})` : ''}` : ''),
-    ),
-    `peak: parallel_downloads = ${peak.concurrency} (${peak.throughputPerSec} pages/s)`,
-    `chose: parallel_downloads = ${best.concurrency} — two tiers down from peak as headroom for sustained load (bench measures bursts of ${BENCH_SAMPLE_SIZE} pages; full sync sustains the load over thousands)`,
-    `wrote to config.yaml; pin a different value by hand if you want to override`,
-  ];
-}
 
 async function runReconvert(): Promise<void> {
   const { config, rootDir } = await loadConfig();

@@ -72,7 +72,7 @@ doc-watcher/
     ├── downloader.ts               # parallel fetch + write, p-limit-bounded
     ├── converter.ts                # storage-format → markdown: cheerio macro pre-pass + in-house walker
     ├── pathing.ts                  # title → slug, rename detection
-    ├── limit.ts                    # inline pLimit (bounded concurrency)
+    ├── adaptive-limiter.ts         # slow-start + AIMD + budget-aware concurrency
     ├── state.ts                    # JSON state file: read, atomic write
     └── log.ts
 ```
@@ -133,33 +133,25 @@ Always deterministic, always replayable. The `.html` file on disk is what the co
 
 ### Core flows
 
-**`npm start`** is the daily driver. With no args it runs `sync`: incremental if state exists, full enumeration if it doesn't (so the first invocation does the bulk download). It also triggers an autotune automatically if `parallel_downloads` is unset in `config.yaml`. Run it again whenever you want fresh docs — subsequent runs only fetch what changed.
+**`npm start`** is the daily driver. With no args it runs `sync`: incremental if state exists, full enumeration if it doesn't (so the first invocation does the bulk download). Run it again whenever you want fresh docs — subsequent runs only fetch what changed.
 
 Verbs:
 
-- **`sync`** (default): autotune if needed → build CQL with `lastmodified` lower bound, page through results, diff against state, fetch changed pages in parallel, write both `.html` and `.md`, atomic state-file replace at the end.
+- **`sync`** (default): build CQL with `lastmodified` lower bound, page through results, diff against state, fetch changed pages in parallel, write both `.html` and `.md`, atomic state-file replace at the end.
 - **`refresh`**: same as `sync` but ignores `last_sync` (full re-download).
 - **`reconvert`**: walk every `.html` already on disk and regenerate the `.md` next to it. No network calls. Used after a converter change.
 
-Setup is manual: copy `config.example.yaml` → `config.yaml` and fill in the placeholders (`base_url`, `pat`, at least one `root_page_ids` entry). The YAML is intentionally flat — every key sits at the top level. `root_page_ids` accepts either a single string or a list of strings; each is a Confluence page id whose subtree gets mirrored. No `init` verb — fewer moving parts.
+Setup is manual: copy `config.example.yaml` → `config.yaml` and fill in the placeholders (`base_url`, `pat`, at least one `root_page_ids` entry). The YAML is intentionally flat — every key sits at the top level. `root_page_ids` accepts either a single string or a list of strings; each is a Confluence page id whose subtree gets mirrored.
 
-There is no explicit `bench` verb. The autotune is internal — triggered only when `parallel_downloads` is missing from `config.yaml`. To force a re-bench, comment out (or delete) the value in `config.yaml` and run `npm start` again.
+### Concurrency: adaptive limiter informed by server headers
 
-### Concurrency autotune
+`parallel_downloads` in `config.yaml` is an *upper ceiling*, not a target. The adaptive limiter starts at concurrency = 1 (slow-start), doubles every 50 sustained successes up to the ceiling, and halves immediately on every 429-wave. `Retry-After` becomes a minimum inter-request spacing for the next window.
 
-The first run is the one that hurts. A space can hold thousands of pages, and the right tuning depends on the network, the server's load, the CPU, and what else is on the machine — there's no universal number that's right. Too low and the initial sync drags; too high and we either saturate the link or trip Confluence's rate limit.
+On top of that reactive AIMD, the client reads Confluence DC's `X-RateLimit-*` headers (`Limit`, `Remaining`, `Interval-Seconds`, `FillRate`) on *every* authenticated response and feeds them to the limiter. When `remaining/limit` drops below 20%, the limiter paces new requests at the sustainable refill rate (`intervalSeconds / fillRate`); below 5%, it pauses long enough for at least one token to refill. Goal: avoid hitting 429 in the first place rather than reacting after the fact. The first observed budget is also logged so you see what your server actually allows (e.g. *"50-token bucket, fills at 10/60s = 0.17 req/s sustainable"*).
 
-So before the first real `sync`, doc-watcher runs a short empirical benchmark. It sweeps a small grid of concurrency values (`[1, 2, 5, 10, 20]`), measures elapsed time and error rate at each point, finds the peak zero-error level, then **steps two tiers down** before writing the chosen value back into `config.yaml` under `sync`. The step-down matters: the bench probes ~30 pages, which measures *burst* tolerance, but a full sync sustains the load across thousands of pages and the server's token bucket only drains under sustained pressure. One-tier step-down proved too aggressive in practice (cascading 429 storms mid-sync); two tiers trades more throughput for much higher reliability. Users who need speed can pin a higher value manually. The HTTP client also retries 429/503 with exponential backoff (up to 8 attempts, max 60 s per wait, `Retry-After` honoured) so transient throttling doesn't kill the run. The retry uses a **client-wide cooldown**: when any one in-flight request gets rate-limited, the wait window is broadcast to every other in-flight request via a shared `throttledUntilMs` on the client. Without that, parallel retries pile back onto the throttled server and turn a single 429 into a cascading storm even at low concurrency.
+The HTTP client also retries 429/503 with exponential backoff (up to 8 attempts, max 60 s per wait, `Retry-After` honoured) as a fallback for when budget signals arrive too late or are missing. The retry uses a **client-wide cooldown**: when any one in-flight request gets rate-limited, the wait window is broadcast to every other in-flight request via a shared `throttledUntilMs` on the client. Without that, parallel retries pile back onto the throttled server and turn a single 429 into a cascading storm even at low concurrency.
 
-**Adaptive concurrency (slow-start + AIMD + proactive budget throttling).** The chosen `parallel_downloads` is treated as a *ceiling*, not a constant. The runtime limiter starts at concurrency = 1 (slow-start), doubles every 50 sustained successes up to the ceiling, halves immediately on every 429-wave, and uses `Retry-After` as a minimum inter-request spacing for the next window. The bench is *not* gated by this — bench measures absolute burst tolerance at fixed concurrency.
-
-On top of the reactive AIMD, the client reads Confluence DC's `X-RateLimit-*` headers (`Limit`, `Remaining`, `Interval-Seconds`, `FillRate`) on *every* authenticated response and feeds them to the limiter. When `remaining/limit` drops below 20%, the limiter paces new requests at the sustainable refill rate (`intervalSeconds / fillRate`); below 5%, it pauses long enough for at least one token to refill. Goal: avoid hitting 429 in the first place rather than reacting after the fact. The first observed budget is also logged so you see what your server actually allows (e.g. *"50-token bucket, fills at 10/60s = 0.17 req/s sustainable"*).
-
-After that, every run just reads the value from `config.yaml`. The bench only runs again when **`parallel_downloads` is missing** (commented out or absent) — that's the sole trigger. Editing the value by hand pins it; the bench won't overwrite a hand-set value.
-
-There's also a fallback heuristic (`min(50, max(4, cpu_cores * 2))`) for the awkward case where the bench is somehow skipped *and* no value exists in config — but in practice, missing-means-bench keeps this from triggering.
-
-Re-bench when conditions change (slower link, server upgrade, etc.) by commenting out the value in `config.yaml` and running `npm start` again.
+No explicit autotune step: with budget headers driving the rate, an upfront benchmark adds no information the limiter can't discover live. The ceiling is just a config knob (default 20); the limiter does the rest.
 
 ## Out of scope (for now)
 

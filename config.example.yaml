@@ -1,6 +1,8 @@
-# Comment this out to trigger a benchmark; the benchmark will uncomment it
-# with a calculated value. Or set your own.
-parallel_downloads: 10
+# Upper ceiling on parallel page fetches. The adaptive limiter starts at 1
+# and ramps up to this value based on what Confluence's X-RateLimit-* headers
+# say is safe. Lower this to enforce a hard cap; raise it to let the limiter
+# ramp higher. Default (when omitted) is 20.
+parallel_downloads: 20
 
 # Root URL of your Confluence install (no trailing slash, no /rest/api).
 base_url: https://confluence.example.com
