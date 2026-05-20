@@ -120,7 +120,7 @@ async function fetchAndWriteOne(
   const absPath = join(opts.outputDir, relPath);
 
   const attachmentRefs: string[] = [];
-  const wantAttachments = opts.config.sync.include_attachments;
+  const wantAttachments = opts.config.include_attachments;
 
   const attachments: ConfluenceAttachment[] = wantAttachments ? await opts.client.getAttachments(page.id) : [];
   const attachmentByName = new Map<string, ConfluenceAttachment>();
@@ -133,7 +133,7 @@ async function fetchAndWriteOne(
       pageId: page.id,
       pagePath: relPath,
       pageSpace: spaceKey,
-      baseUrl: opts.config.confluence.base_url,
+      baseUrl: opts.config.base_url,
       state: opts.state,
       knownPagePaths: opts.knownPagePaths,
       titleIndex: opts.titleIndex,
@@ -165,7 +165,7 @@ async function fetchAndWriteOne(
   // Write the raw storage-format HTML next to the .md so reconvert can rebuild the
   // markdown later without re-hitting Confluence.
   const htmlAbsPath = htmlPathFor(absPath);
-  const sourceUrl = sourceUrlFor(opts.config.confluence.base_url, page.id);
+  const sourceUrl = sourceUrlFor(opts.config.base_url, page.id);
   const mdBody = buildMarkdownBody(sourceUrl, page.title, conversion.markdown);
 
   await mkdir(dirname(absPath), { recursive: true });
@@ -184,7 +184,7 @@ function fallbackParallelDownloads(): number {
 }
 
 export async function downloadPages(pages: ConfluencePage[], opts: DownloadOptions, syncIso: string): Promise<DownloadResult> {
-  const limit = opts.config.sync.parallel_downloads ?? fallbackParallelDownloads();
+  const limit = opts.config.parallel_downloads ?? fallbackParallelDownloads();
   const limiter = pLimit(limit);
   const written: string[] = [];
   const attachments: string[] = [];

@@ -3,37 +3,23 @@ import { resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
 
-// Each watch entry mirrors one Confluence page subtree (the root page and
-// everything beneath it). Add more entries to mirror additional roots.
-export const watchSchema = z.object({
-  root_page_id: z.string().min(1),
-});
-
+// Flat schema — every setting lives at the top level. `watch` is a list of
+// Confluence page ids; each one is mirrored along with everything beneath it.
 export const configSchema = z.object({
-  confluence: z.object({
-    base_url: z.string().url(),
-    pat: z.string().min(1, 'pat is required in confluence: — paste your Confluence PAT here'),
-  }),
-  paths: z
-    .object({
-      output_dir: z.string().default('./docs'),
-      state_dir: z.string().default('./.state'),
-      cache_html: z.boolean().default(false),
-    })
-    .default({ output_dir: './docs', state_dir: './.state', cache_html: false }),
-  sync: z
-    .object({
-      // Missing/undefined = "needs autotune". `npm start` runs the autotune on
-      // startup when this is unset, and writes the chosen value back here.
-      parallel_downloads: z.number().int().positive().optional(),
-      include_attachments: z.boolean().default(false),
-    })
-    .default({ include_attachments: false }),
-  watch: z.array(watchSchema).min(1),
+  base_url: z.string().url(),
+  pat: z.string().min(1, 'pat is required — paste your Confluence PAT'),
+  output_dir: z.string().default('./docs'),
+  // Missing/undefined = "needs autotune". `npm start` runs the autotune on
+  // startup when this is unset, and writes the chosen value back here.
+  parallel_downloads: z.number().int().positive().optional(),
+  include_attachments: z.boolean().default(false),
+  watch: z.array(z.string().min(1)).min(1),
 });
 
 export type Config = z.infer<typeof configSchema>;
-export type WatchEntry = z.infer<typeof watchSchema>;
+// A `WatchEntry` is just a page id now — kept as an alias so existing code
+// continues to import the same name.
+export type WatchEntry = string;
 
 export interface LoadedConfig {
   config: Config;

@@ -16,7 +16,7 @@ cp config.example.yaml config.yaml
 Open `config.yaml` and fill in:
 - `confluence.base_url` — your Confluence root URL.
 - `confluence.pat` — your Personal Access Token (creation steps are in the comment above the field).
-- `watch[].root_page_id` — at least one page id to mirror (the root and everything beneath it).
+- `watch` — at least one Confluence page id to mirror (the root and everything beneath it). Just plain strings in a list.
 
 `config.yaml` is gitignored; the example file stays clean.
 
@@ -45,9 +45,8 @@ For manual operations instead of the default sync flow:
 The local tree mirrors Confluence; each page's id is appended after `--` so title changes become clean `git mv`s. Every page produces two files side by side — `.html` (raw storage format, the source of truth) and `.md` (the human-readable view derived from it).
 
 ```
-.state/
-  index.json                          # state, page metadata, link resolution
 docs/
+  .state.json                         # state, page metadata, link resolution (hidden)
   ENG/
     _index.html / _index.md
     onboarding--67890/
@@ -57,7 +56,7 @@ docs/
     attachments/67890/diagram.png
 ```
 
-The `.md` has no YAML frontmatter — just the page body, prefixed with a one-line autolink back to the Confluence source so anyone reading the file knows where it came from. All structured metadata (id, version, ancestors, links, embeds) lives in `.state/index.json`.
+The `.md` has no YAML frontmatter — just the page body, prefixed with a one-line autolink back to the Confluence source so anyone reading the file knows where it came from. All structured metadata (id, version, ancestors, links, embeds) lives in `<output_dir>/.state.json`.
 
 ## Limitations
 

@@ -31,15 +31,15 @@ const BENCH_CONCURRENCY_LEVELS = [1, 2, 5, 10, 20];
 const FULL_ENUMERATION_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 function buildFullEnumerationCQL(watch: WatchEntry): string {
-  return `(id = ${watch.root_page_id} OR ancestor = ${watch.root_page_id}) AND type = page`;
+  return `(id = ${watch} OR ancestor = ${watch}) AND type = page`;
 }
 
 async function ensureTuned(): Promise<void> {
   const { config } = await loadConfig();
-  if (config.sync.parallel_downloads && config.sync.parallel_downloads > 0) {
+  if (config.parallel_downloads && config.parallel_downloads > 0) {
     log.info(
-      { parallel_downloads: config.sync.parallel_downloads },
-      `using configured parallel_downloads = ${config.sync.parallel_downloads}; skipping autotune`,
+      { parallel_downloads: config.parallel_downloads },
+      `using configured parallel_downloads = ${config.parallel_downloads}; skipping autotune`,
     );
     return;
   }
@@ -54,12 +54,10 @@ async function ensureTuned(): Promise<void> {
 async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }): Promise<void> {
   await ensureTuned();
   const { config, rootDir } = await loadConfig();
-  const stateDir = resolve(rootDir, config.paths.state_dir);
-  const outputDir = resolve(rootDir, config.paths.output_dir);
+  const outputDir = resolve(rootDir, config.output_dir);
   await mkdir(outputDir, { recursive: true });
-  await mkdir(stateDir, { recursive: true });
 
-  const state = opts.full ? emptyState() : await readState(stateDir);
+  const state = opts.full ? emptyState() : await readState(outputDir);
   const localCount = Object.keys(state.pages).length;
   log.info(
     { localCount, lastSync: state.last_sync ?? '(none)', full: opts.full },
@@ -67,8 +65,8 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
   );
 
   const client = new ConfluenceClient({
-    baseUrl: config.confluence.base_url,
-    pat: config.confluence.pat,
+    baseUrl: config.base_url,
+    pat: config.pat,
   });
 
   const since = opts.full ? undefined : state.last_sync ?? undefined;
@@ -133,7 +131,7 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
       // `last_sync` stays at its previous value until the end of this run,
       // so on resume the same CQL diff is re-issued; pages already in state
       // are skipped via the version check.
-      flushState: () => writeState(stateDir, state),
+      flushState: () => writeState(outputDir, state),
     },
     syncIso,
   );
@@ -195,7 +193,7 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
       `last_sync NOT advanced because ${result.errors.length} page(s) failed; they'll be retried on the next run`,
     );
   }
-  await writeState(stateDir, state);
+  await writeState(outputDir, state);
 
   // Count how much of toFetch landed successfully, split by new vs updated.
   const writtenSet = new Set(result.written);
@@ -226,19 +224,27 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
     errorSummary[code] = (errorSummary[code] ?? 0) + 1;
   }
 
+  // Out of `candidates` pages in the CQL window, `downloaded` were actually
+  // fetched this run; the rest were skipped because state already had them
+  // at the current version.
+  const candidates = seen.size;
+  const downloaded = result.written.length;
+  const skipped = candidates - toFetch.length;
+
   // Build a human-readable headline.
   let headline: string;
   if (isFirstSync) {
-    headline = `initial sync complete — ${addedCount} page${addedCount === 1 ? '' : 's'} downloaded`;
+    headline = `initial sync complete — ${downloaded} of ${candidates} downloaded`;
   } else if (totalChanges === 0 && result.errors.length === 0) {
-    headline = 'no changes since your last run';
+    headline = `no changes since your last run — 0 of ${candidates} downloaded (all ${skipped} already up to date)`;
   } else {
     const parts: string[] = [];
     if (addedCount > 0) parts.push(`${addedCount} new`);
     if (updatedCount > 0) parts.push(`${updatedCount} updated`);
     if (deletedCount > 0) parts.push(`${deletedCount} deleted`);
     const breakdown = parts.length > 0 ? ` (${parts.join(', ')})` : '';
-    headline = `${totalChanges} change${totalChanges === 1 ? '' : 's'} since your last run${breakdown}`;
+    const skippedNote = skipped > 0 ? `; ${skipped} skipped (already up to date)` : '';
+    headline = `${totalChanges} change${totalChanges === 1 ? '' : 's'} since your last run${breakdown} — ${downloaded} of ${candidates} downloaded${skippedNote}`;
   }
   if (result.errors.length > 0) {
     const errParts = Object.entries(errorSummary).map(([k, v]) => `${k}=${v}`).join(', ');
@@ -275,8 +281,8 @@ async function runBench(): Promise<void> {
   }
 
   const client = new ConfluenceClient({
-    baseUrl: config.confluence.base_url,
-    pat: config.confluence.pat,
+    baseUrl: config.base_url,
+    pat: config.pat,
   });
 
   // Collect a sample of page ids from the first watch scope. We stop after
@@ -386,40 +392,27 @@ async function runBench(): Promise<void> {
       `picking ${best.concurrency} (two tiers down) for sustained-load headroom`,
   );
 
-  // Match any existing line — commented or not — preserving leading indentation
-  // (YAML cares). Falls back to inserting under the `sync:` key.
+  // Flat YAML: find any existing parallel_downloads line (commented or not)
+  // at column 0 and rewrite it. Append at end of file if there's no such line.
   const text = await readFile(configPath, 'utf8');
-  const lineRe = /^([ \t]*)#?[ \t]*parallel_downloads[ \t]*:[ \t]*\d+[^\n]*$/m;
-  const syncHeaderRe = /^sync:[ \t]*$/m;
+  const lineRe = /^#?[ \t]*parallel_downloads[ \t]*:[ \t]*\d+[^\n]*$/m;
+  const newLine = `parallel_downloads: ${best.concurrency}`;
 
-  let updated: string | null = null;
-  const lineMatch = text.match(lineRe);
-  if (lineMatch) {
-    const indent = lineMatch[1] ?? '  ';
-    updated = text.replace(lineRe, `${indent}parallel_downloads: ${best.concurrency}`);
-  } else if (syncHeaderRe.test(text)) {
-    updated = text.replace(syncHeaderRe, `sync:\n  parallel_downloads: ${best.concurrency}`);
-  }
+  const updated = lineRe.test(text)
+    ? text.replace(lineRe, newLine)
+    : `${text.replace(/\n+$/, '')}\n${newLine}\n`;
 
-  if (updated !== null) {
-    await writeFile(configPath, updated, 'utf8');
-    log.info(
-      { configPath, value: best.concurrency },
-      `wrote parallel_downloads: ${best.concurrency} to config.yaml`,
-    );
-  } else {
-    log.warn(
-      { value: best.concurrency },
-      `config.yaml has no sync: section; add it manually:\nsync:\n  parallel_downloads: ${best.concurrency}`,
-    );
-  }
+  await writeFile(configPath, updated, 'utf8');
+  log.info(
+    { configPath, value: best.concurrency },
+    `wrote parallel_downloads: ${best.concurrency} to config.yaml`,
+  );
 }
 
 async function runReconvert(): Promise<void> {
   const { config, rootDir } = await loadConfig();
-  const stateDir = resolve(rootDir, config.paths.state_dir);
-  const outputDir = resolve(rootDir, config.paths.output_dir);
-  const state = await readState(stateDir);
+  const outputDir = resolve(rootDir, config.output_dir);
+  const state = await readState(outputDir);
 
   if (Object.keys(state.pages).length === 0) {
     log.warn('state is empty; nothing to reconvert. Run `sync` or `refresh` first.');
@@ -456,13 +449,13 @@ async function runReconvert(): Promise<void> {
         pageId: id,
         pagePath: p.path,
         pageSpace: p.space,
-        baseUrl: config.confluence.base_url,
+        baseUrl: config.base_url,
         state,
         knownPagePaths,
         titleIndex,
       }),
     );
-    const sourceUrl = sourceUrlFor(config.confluence.base_url, id);
+    const sourceUrl = sourceUrlFor(config.base_url, id);
     const body = buildMarkdownBody(sourceUrl, p.title, conversion.markdown);
     await writeFile(mdAbs, body, 'utf8');
     processed++;

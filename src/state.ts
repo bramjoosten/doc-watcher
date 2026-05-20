@@ -19,12 +19,15 @@ export function emptyState(): StateFile {
   return { last_sync: null, last_full_enumeration: null, pages: {} };
 }
 
-export function stateFilePath(stateDir: string): string {
-  return join(stateDir, 'index.json');
+// State lives inside the output directory — hidden by the leading dot so it
+// doesn't clutter the docs tree, and so a `cp -r docs/ elsewhere/` carries
+// the state with it.
+export function stateFilePath(outputDir: string): string {
+  return join(outputDir, '.state.json');
 }
 
-export async function readState(stateDir: string): Promise<StateFile> {
-  const path = stateFilePath(stateDir);
+export async function readState(outputDir: string): Promise<StateFile> {
+  const path = stateFilePath(outputDir);
   try {
     const buf = await readFile(path, 'utf8');
     const parsed = JSON.parse(buf) as Partial<StateFile>;
@@ -41,8 +44,8 @@ export async function readState(stateDir: string): Promise<StateFile> {
 
 // Atomic write: write to a sibling .tmp file, then rename. If the process dies
 // mid-write, the original file is intact and the .tmp is orphaned.
-export async function writeState(stateDir: string, state: StateFile): Promise<void> {
-  const path = stateFilePath(stateDir);
+export async function writeState(outputDir: string, state: StateFile): Promise<void> {
+  const path = stateFilePath(outputDir);
   await mkdir(dirname(path), { recursive: true });
   const tmp = `${path}.tmp`;
   await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, 'utf8');

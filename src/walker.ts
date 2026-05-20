@@ -23,7 +23,8 @@ function quoteCQLDate(iso: string): string {
 }
 
 export function buildCQL(watch: WatchEntry, sinceIso?: string): string {
-  let base = `(id = ${watch.root_page_id} OR ancestor = ${watch.root_page_id}) AND type = page`;
+  // `watch` is a Confluence page id. Mirror that page and every descendant.
+  let base = `(id = ${watch} OR ancestor = ${watch}) AND type = page`;
   if (sinceIso) base += ` AND lastmodified >= ${quoteCQLDate(sinceIso)}`;
   return base;
 }

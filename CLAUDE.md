@@ -33,7 +33,7 @@ Node.js, TypeScript, run via `tsx`.
 
 ### State: plain JSON, not frontmatter
 
-The `.md` files have **no YAML frontmatter** — they're plain prose, easier for grep, editors, and LLMs to consume. All structural metadata (Confluence ID, version, ancestors, last-modified, links, embeds) lives in `<state_dir>/index.json`, with one entry per page keyed by Confluence ID. The state file is the source of truth for change detection and link resolution; the on-disk tree is the human-facing view derived from it. Writes are atomic via `tmp` + `rename` — interrupted runs never leave a half-written state file.
+The `.md` files have **no YAML frontmatter** — they're plain prose, easier for grep, editors, and LLMs to consume. All structural metadata (Confluence ID, version, ancestors, last-modified, links, embeds) lives in `<output_dir>/.state.json` (the state file sits inside the docs directory, hidden by the leading dot), with one entry per page keyed by Confluence ID. The state file is the source of truth for change detection and link resolution; the on-disk tree is the human-facing view derived from it. Writes are atomic via `tmp` + `rename` — interrupted runs never leave a half-written state file.
 
 State is **flushed after every successful page write** during a sync, not just at the end. So an interrupt (Ctrl+C, crash, network failure) leaves the state file reflecting exactly the pages already on disk. The next `npm start` re-queries the same CQL window (last_sync doesn't advance until the sync completes), diffs against the persisted per-page versions, and only fetches the pages not yet recorded. Resume is automatic — no `--resume` flag, no special verb.
 
@@ -53,7 +53,7 @@ doc-watcher/
 ├── README.md
 ├── config.example.yaml
 ├── config.yaml                     # gitignored — base_url, pat, watch roots, etc.
-├── .gitignore                      # ignores config.yaml, docs/, .state/, .claude/, node_modules/
+├── .gitignore                      # ignores config.yaml, docs/, .claude/, node_modules/
 └── src/
     ├── taskmanager.ts              # entry point: sync / refresh / reconvert
     ├── config.ts                   # zod schema, YAML loader
@@ -70,9 +70,8 @@ doc-watcher/
 ### Output layout (`docs/` mirrors Confluence)
 
 ```
-.state/
-  index.json                              # state + structural metadata
 docs/
+  .state.json                             # state + structural metadata (hidden)
   ENG/                                    # space key
     _index.html / _index.md               # space homepage
     onboarding--67890/                    # parent page → folder; ID after `--`
@@ -127,7 +126,7 @@ Verbs:
 - **`refresh`**: same as `sync` but ignores `last_sync` (full re-download).
 - **`reconvert`**: walk every `.html` already on disk and regenerate the `.md` next to it. No network calls. Used after a converter change.
 
-Setup is manual: copy `config.example.yaml` → `config.yaml` and fill in the placeholders (`base_url`, `pat`, `watch[].root_page_id`). No `init` verb — fewer moving parts.
+Setup is manual: copy `config.example.yaml` → `config.yaml` and fill in the placeholders (`base_url`, `pat`, at least one entry in `watch`). The YAML is intentionally flat — every key sits at the top level, `watch` is just a list of Confluence page ids. No `init` verb — fewer moving parts.
 
 There is no explicit `bench` verb. The autotune is internal — triggered only when `parallel_downloads` is missing from `config.yaml`. To force a re-bench, comment out (or delete) the value in `config.yaml` and run `npm start` again.
 
