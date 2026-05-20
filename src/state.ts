@@ -87,12 +87,25 @@ export async function readIndex(filePath: string, rootId: string, rootTitle: str
   return state;
 }
 
+// Wrap the state with a self-describing header before serialising. The
+// description block isn't part of the StateFile shape — it's regenerated on
+// every write so the file is self-explaining to anyone who opens it.
+function withDescription(state: StateFile): unknown {
+  return {
+    description: {
+      purpose: `Source of truth for doc-watcher's sync state of Confluence root page ${state.root_page_id} ("${state.root_title}")`,
+      note: 'Updated mid-sync via the sibling .jsonl append-log; rewritten in full at end of sync. The sibling tree-*.json is a derived, human-navigation view of the same data.',
+    },
+    ...state,
+  };
+}
+
 // Atomic write: write to a sibling .tmp file, then rename. If the process dies
 // mid-write, the original file is intact and the .tmp is orphaned.
 export async function writeIndex(filePath: string, state: StateFile): Promise<void> {
   await mkdir(dirname(filePath), { recursive: true });
   const tmp = `${filePath}.tmp`;
-  await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  await writeFile(tmp, `${JSON.stringify(withDescription(state), null, 2)}\n`, 'utf8');
   await rename(tmp, filePath);
 }
 
