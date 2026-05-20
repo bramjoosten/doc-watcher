@@ -92,10 +92,7 @@ export async function readIndex(filePath: string, rootId: string, rootTitle: str
 // every write so the file is self-explaining to anyone who opens it.
 function withDescription(state: StateFile): unknown {
   return {
-    description: {
-      purpose: `Source of truth for doc-watcher's sync state of Confluence root page ${state.root_page_id} ("${state.root_title}")`,
-      note: 'This is a full snapshot, rewritten only at the END of each sync. During a sync the .json is NOT touched (it would be wasteful to re-serialise an MB-sized file on every page); in-flight page writes append to a sibling .jsonl, which is overlaid (last-wins by id) on the next read for transparent interrupt recovery. The sibling tree-*.json is a derived human-navigation view of the same data.',
-    },
+    description: `Source of truth for doc-watcher's sync state of Confluence root page ${state.root_page_id} ("${state.root_title}"). This is a full snapshot, rewritten only at the END of each sync. During a sync the .json is NOT touched (it would be wasteful to re-serialise an MB-sized file on every page); in-flight page writes append to a sibling .jsonl, which is overlaid (last-wins by id) on the next read for transparent interrupt recovery. The sibling tree-*.json is a derived human-navigation view of the same data.`,
     ...state,
   };
 }
@@ -174,11 +171,7 @@ export interface TreeNode {
 }
 
 export interface TreeDocument {
-  explanation: {
-    purpose: string;
-    source_of_truth: string;
-    note: string;
-  };
+  description: string;
   root: TreeNode;
 }
 
@@ -220,11 +213,7 @@ export function buildTree(state: StateFile, indexFileName: string): TreeDocument
   };
 
   return {
-    explanation: {
-      purpose: 'Reference document for human navigation. Use your IDE\'s JSON code-folding to browse the page hierarchy.',
-      source_of_truth: `${indexFileName} (sibling file) — this tree is derived from it.`,
-      note: 'Regenerated at the end of every sync — do not edit by hand.',
-    },
+    description: `Reference document for human navigation — use your IDE's JSON code-folding to browse the page hierarchy. The sibling ${indexFileName} is the source of truth; this tree is derived from it. Regenerated at the end of every sync — do not edit by hand.`,
     root: node(rootId),
   };
 }
