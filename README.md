@@ -16,7 +16,7 @@ cp config.example.yaml config.yaml
 Open `config.yaml` and fill in:
 - `confluence.base_url` — your Confluence root URL.
 - `confluence.pat` — your Personal Access Token (creation steps are in the comment above the field).
-- `watch` — at least one Confluence page id to mirror (the root and everything beneath it). Just plain strings in a list.
+- `root_page_ids` — one Confluence page id (as a string) or a list of them; each id is the root of a subtree to mirror.
 
 `config.yaml` is gitignored; the example file stays clean.
 

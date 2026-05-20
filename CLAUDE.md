@@ -52,13 +52,13 @@ doc-watcher/
 ├── tsconfig.json
 ├── README.md
 ├── config.example.yaml
-├── config.yaml                     # gitignored — base_url, pat, watch roots, etc.
+├── config.yaml                     # gitignored — base_url, pat, root_page_ids, etc.
 ├── .gitignore                      # ignores config.yaml, docs/, .claude/, node_modules/
 └── src/
     ├── taskmanager.ts              # entry point: sync / refresh / reconvert
     ├── config.ts                   # zod schema, YAML loader
     ├── confluence.ts               # REST client (typed wrappers around fetch)
-    ├── walker.ts                   # expand watch scopes → page id list (CQL)
+    ├── walker.ts                   # expand root_page_ids → page id list (CQL)
     ├── downloader.ts               # parallel fetch + write, p-limit-bounded
     ├── converter.ts                # storage-format → markdown: cheerio macro pre-pass + in-house walker
     ├── pathing.ts                  # title → slug, rename detection
@@ -126,7 +126,7 @@ Verbs:
 - **`refresh`**: same as `sync` but ignores `last_sync` (full re-download).
 - **`reconvert`**: walk every `.html` already on disk and regenerate the `.md` next to it. No network calls. Used after a converter change.
 
-Setup is manual: copy `config.example.yaml` → `config.yaml` and fill in the placeholders (`base_url`, `pat`, at least one entry in `watch`). The YAML is intentionally flat — every key sits at the top level, `watch` is just a list of Confluence page ids. No `init` verb — fewer moving parts.
+Setup is manual: copy `config.example.yaml` → `config.yaml` and fill in the placeholders (`base_url`, `pat`, at least one `root_page_ids` entry). The YAML is intentionally flat — every key sits at the top level. `root_page_ids` accepts either a single string or a list of strings; each is a Confluence page id whose subtree gets mirrored. No `init` verb — fewer moving parts.
 
 There is no explicit `bench` verb. The autotune is internal — triggered only when `parallel_downloads` is missing from `config.yaml`. To force a re-bench, comment out (or delete) the value in `config.yaml` and run `npm start` again.
 

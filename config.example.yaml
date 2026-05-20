@@ -1,9 +1,13 @@
+# Comment this out to trigger a benchmark; the benchmark will uncomment it
+# with a calculated value. Or set your own.
+parallel_downloads: 10
+
+# Root URL of your Confluence install (no trailing slash, no /rest/api).
 base_url: https://confluence.example.com
 
 # Confluence Server/DC Personal Access Token (Bearer auth).
 # Create one at: <your-confluence>/plugins/personalaccesstokens/usertokens.action
 # (or: profile picture → Settings → Personal Access Tokens → Create token).
-# The token is shown only once on creation — paste it here before closing the dialog.
 pat: ""
 
 # Where the mirrored docs go. Both the .html / .md pair for each page and the
@@ -16,13 +20,12 @@ output_dir: ./docs
 # Non-inline file attachments (PDFs, decks, etc.) are not mirrored either way.
 include_attachments: false
 
-# Comment this out to trigger a benchmark; the benchmark will uncomment it
-# with a calculated value. Or set your own.
-# parallel_downloads: 10
-
-# Confluence page ids to mirror. Each entry is one page id — that page and
-# every descendant beneath it (any depth) get pulled. Find the id in the URL
-# (?pageId=NNNNN); if you only see the pretty /display/SPACE/Title form,
-# click Edit and the id shows up. Add more ids to mirror more subtrees.
-watch:
-  - "123456"
+# Confluence page ids whose subtrees to mirror — that page plus every
+# descendant beneath it, any depth. Accept either a single id or a list:
+#   root_page_ids: "123456"
+#   root_page_ids:
+#     - "123456"
+#     - "234567"
+# Find the id in the URL (?pageId=NNNNN); if you only see the pretty
+# /display/SPACE/Title form, click Edit and the id shows up.
+root_page_ids: "123456"

@@ -70,7 +70,7 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
   });
 
   const since = opts.full ? undefined : state.last_sync ?? undefined;
-  const scopes = planScopes(config.watch, since);
+  const scopes = planScopes(config.root_page_ids, since);
   log.info({ scopes: scopes.map((s) => s.cql), full: opts.full }, 'planned scopes');
 
   const seen = new Map<string, Awaited<ReturnType<typeof client.searchByCQL>>[number]>();
@@ -153,7 +153,7 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
       allIds = new Set(seen.keys());
     } else {
       const fullSeen = new Set<string>();
-      for (const watch of config.watch) {
+      for (const watch of config.root_page_ids) {
         const cql = buildFullEnumerationCQL(watch);
         const results = await client.searchByCQL(cql, ['version']);
         for (const r of results) fullSeen.add(r.id);
@@ -266,9 +266,9 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
 
 async function runBench(): Promise<void> {
   const { config, rootDir } = await loadConfig();
-  const firstScope = config.watch[0];
+  const firstScope = config.root_page_ids[0];
   if (!firstScope) {
-    log.error('no [[watch]] scopes configured; nothing to bench');
+    log.error('no root_page_ids configured; nothing to bench');
     process.exitCode = 1;
     return;
   }
@@ -285,7 +285,7 @@ async function runBench(): Promise<void> {
     pat: config.pat,
   });
 
-  // Collect a sample of page ids from the first watch scope. We stop after
+  // Collect a sample of page ids from the first root subtree. We stop after
   // BENCH_SAMPLE_SIZE so a 10k-page space costs one /search call, not the full sweep.
   const cql = buildFullEnumerationCQL(firstScope);
   const params = new URLSearchParams();
@@ -300,7 +300,7 @@ async function runBench(): Promise<void> {
     if (sample.length >= BENCH_SAMPLE_SIZE) break;
   }
   if (sample.length === 0) {
-    log.error({ scope: firstScope }, 'no pages found in the first watch scope; cannot bench');
+    log.error({ scope: firstScope }, 'no pages found under the first root_page_id; cannot bench');
     process.exitCode = 1;
     return;
   }

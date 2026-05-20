@@ -3,8 +3,9 @@ import { resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
 
-// Flat schema — every setting lives at the top level. `watch` is a list of
-// Confluence page ids; each one is mirrored along with everything beneath it.
+// Flat schema — every setting lives at the top level. `root_page_ids` accepts
+// either a single string or an array of strings; each is the id of a
+// Confluence page whose subtree (the page + every descendant) gets mirrored.
 export const configSchema = z.object({
   base_url: z.string().url(),
   pat: z.string().min(1, 'pat is required — paste your Confluence PAT'),
@@ -13,12 +14,13 @@ export const configSchema = z.object({
   // startup when this is unset, and writes the chosen value back here.
   parallel_downloads: z.number().int().positive().optional(),
   include_attachments: z.boolean().default(false),
-  watch: z.array(z.string().min(1)).min(1),
+  root_page_ids: z
+    .union([z.string().min(1), z.array(z.string().min(1)).min(1)])
+    .transform((v) => (Array.isArray(v) ? v : [v])),
 });
 
 export type Config = z.infer<typeof configSchema>;
-// A `WatchEntry` is just a page id now — kept as an alias so existing code
-// continues to import the same name.
+// A page-id string — the unit a planScope / fetchAndWriteOne operates on.
 export type WatchEntry = string;
 
 export interface LoadedConfig {
