@@ -1,7 +1,6 @@
 import { mkdir, writeFile } from 'node:fs/promises';
-import { cpus } from 'node:os';
 import { dirname, join, posix } from 'node:path';
-import { pLimit, type LimitFunction } from './limit.js';
+import { AdaptiveLimiter } from './adaptive-limiter.js';
 import type { Config } from './config.js';
 import type { ConfluenceAttachment, ConfluenceClient, ConfluencePage } from './confluence.js';
 import { convertStorageFormat } from './converter.js';
@@ -30,10 +29,13 @@ export interface DownloadOptions {
   // Configured root page ids. Used to trim Confluence's full ancestor chain
   // so the on-disk tree starts at the user's chosen root, not the space root.
   rootPageIds: Set<string>;
+  // Shared adaptive limiter — gates concurrency + inter-request spacing,
+  // shrinks on 429, grows on sustained success. One per runSync invocation.
+  limiter: AdaptiveLimiter;
   // Called after each successful page write so state is persisted incrementally.
-  // If the process is interrupted mid-sync, the next run resumes from the last
-  // flushed state instead of re-downloading the whole batch.
-  flushState?: () => Promise<void>;
+  // The id is the page that was just written; callers can append it to a
+  // jsonl rather than re-serialising the full state every time.
+  flushState?: (id: string) => Promise<void>;
 }
 
 export interface DownloadResult {
@@ -178,7 +180,7 @@ export function buildConvertOptions(args: {
 async function fetchAndWriteOne(
   page: ConfluencePage,
   opts: DownloadOptions,
-  limiter: LimitFunction,
+  limiter: AdaptiveLimiter,
   syncIso: string,
 ): Promise<{ relPath: string; attachments: string[] }> {
   const spaceKey = page.space?.key ?? 'UNKNOWN';
@@ -209,7 +211,7 @@ async function fetchAndWriteOne(
   if (wantAttachments) {
     await Promise.all(
       conversion.images.map((img) =>
-        limiter(async () => {
+        limiter.wrap(async () => {
           const att = attachmentByName.get(img.filename);
           if (!att) return;
           const downloadHref = att._links?.download;
@@ -252,14 +254,8 @@ async function fetchAndWriteOne(
   return { relPath, attachments: attachmentRefs };
 }
 
-// Used if autotune hasn't run yet (or failed) and config has no value.
-function fallbackParallelDownloads(): number {
-  return Math.min(50, Math.max(4, (cpus()?.length ?? 4) * 2));
-}
-
 export async function downloadPages(pages: ConfluencePage[], opts: DownloadOptions, syncIso: string): Promise<DownloadResult> {
-  const limit = opts.config.parallel_downloads ?? fallbackParallelDownloads();
-  const limiter = pLimit(limit);
+  const limiter = opts.limiter;
   const written: string[] = [];
   const attachments: string[] = [];
   const errors: { id: string; error: unknown }[] = [];
@@ -272,7 +268,7 @@ export async function downloadPages(pages: ConfluencePage[], opts: DownloadOptio
 
   await Promise.all(
     pages.map((page) =>
-      limiter(async () => {
+      limiter.wrap(async () => {
         try {
           const detailed = page.body?.storage ? page : await opts.client.getPage(page.id);
           const result = await fetchAndWriteOne(detailed, opts, limiter, syncIso);
@@ -295,6 +291,8 @@ export async function downloadPages(pages: ConfluencePage[], opts: DownloadOptio
           // Keep the top-of-state counter up to date even mid-sync, so an
           // interrupted run's per-root index file still reflects the true count.
           opts.state.total_pages_downloaded = Object.keys(opts.state.pages).length;
+          // Tell the adaptive limiter we landed one — moves toward bumping capacity.
+          opts.limiter.reportSuccess();
 
           const now = Date.now();
           if (now - lastProgressAt >= PROGRESS_INTERVAL_MS) {
@@ -310,7 +308,7 @@ export async function downloadPages(pages: ConfluencePage[], opts: DownloadOptio
           // state object's current snapshot.
           if (opts.flushState) {
             try {
-              await opts.flushState();
+              await opts.flushState(detailed.id);
             } catch (err) {
               log.warn({ err, id: detailed.id }, 'failed to flush state mid-sync (will retry on next page)');
             }

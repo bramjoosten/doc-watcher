@@ -49,6 +49,10 @@ JSON over SQLite is deliberate: doc-watcher is single-process and the whole stat
 
 **Markdown frontmatter view.** Every converted `.md` starts with a YAML frontmatter block carrying `title`, `version`, `last_modified`, `last_modified_by`, and `webui_url`. The `webui_url` is the full clickable URL (with base) so the file is self-traceable without consulting the index. The frontmatter is composed from the per-root index entry at write time — the index is the source of truth, the frontmatter is a regeneratable view; `reconvert` rewrites it from index data on every run. The body itself starts with `# <title>` as the H1 (Confluence's storage-format body doesn't include the title, so we add it for plain markdown viewers that don't read frontmatter).
 
+**Per-page write goes to a sibling `.jsonl`, finalized into `.json` at end of sync.** Rewriting the full ~MB-sized `.json` on every page flush was wasteful. Each per-page success appends one line to `<output_dir>/index-<slug>--<id>.jsonl` instead. At the end of each per-root sync, `finalizeIndex` collapses the in-memory state into a fresh `.json` snapshot and deletes the `.jsonl`. If a sync is interrupted, the `.jsonl` persists; the next `readIndex` overlays its lines onto the loaded `.json` (last-wins by id), so resume is transparent.
+
+**Tree view.** Alongside each `index-<slug>--<id>.json`, a `tree-<slug>--<id>.json` carries a nested `{ id, title, path, children: [...] }` representation of the subtree — handy for IDE code-folding and visual navigation. Regenerated from index at every `finalizeIndex`.
+
 ### File layout
 
 ```
@@ -78,7 +82,9 @@ doc-watcher/
 ```
 docs/
   index-team-foo--12345.json              # per-root index for root id 12345
+  tree-team-foo--12345.json               # nested view of the same subtree
   index-team-bar--67890.json              # per-root index for root id 67890
+  tree-team-bar--67890.json               # nested view
   ENG/                                    # space key
     _index.html / _index.md               # space homepage
     onboarding--67890/                    # parent page → folder; ID after `--`
@@ -144,6 +150,8 @@ There is no explicit `bench` verb. The autotune is internal — triggered only w
 The first run is the one that hurts. A space can hold thousands of pages, and the right tuning depends on the network, the server's load, the CPU, and what else is on the machine — there's no universal number that's right. Too low and the initial sync drags; too high and we either saturate the link or trip Confluence's rate limit.
 
 So before the first real `sync`, doc-watcher runs a short empirical benchmark. It sweeps a small grid of concurrency values (`[1, 2, 5, 10, 20]`), measures elapsed time and error rate at each point, finds the peak zero-error level, then **steps two tiers down** before writing the chosen value back into `config.yaml` under `sync`. The step-down matters: the bench probes ~30 pages, which measures *burst* tolerance, but a full sync sustains the load across thousands of pages and the server's token bucket only drains under sustained pressure. One-tier step-down proved too aggressive in practice (cascading 429 storms mid-sync); two tiers trades more throughput for much higher reliability. Users who need speed can pin a higher value manually. The HTTP client also retries 429/503 with exponential backoff (up to 8 attempts, max 60 s per wait, `Retry-After` honoured) so transient throttling doesn't kill the run. The retry uses a **client-wide cooldown**: when any one in-flight request gets rate-limited, the wait window is broadcast to every other in-flight request via a shared `throttledUntilMs` on the client. Without that, parallel retries pile back onto the throttled server and turn a single 429 into a cascading storm even at low concurrency.
+
+**Adaptive concurrency (slow-start + AIMD).** The chosen `parallel_downloads` is treated as a *ceiling*, not a constant. The runtime limiter starts at concurrency = 1 (slow-start), doubles every 50 sustained successes up to the ceiling, halves immediately on every 429-wave, and uses `Retry-After` as a minimum inter-request spacing for the next window (no new request fires until the server's recovery hint has elapsed). Net effect: cold starts don't blast the rate-limit wall; sustained throttling pulls concurrency back to where the server is comfortable; recovery is slow enough not to whipsaw. The bench is *not* gated by this — bench measures absolute burst tolerance at fixed concurrency.
 
 After that, every run just reads the value from `config.yaml`. The bench only runs again when **`parallel_downloads` is missing** (commented out or absent) — that's the sole trigger. Editing the value by hand pins it; the bench won't overwrite a hand-set value.
 

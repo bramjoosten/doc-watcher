@@ -5,7 +5,9 @@ import './disable-tls-check.js';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { cpus } from 'node:os';
 import { pLimit } from './limit.js';
+import { AdaptiveLimiter } from './adaptive-limiter.js';
 import { loadConfig } from './config.js';
 import { ConfluenceClient } from './confluence.js';
 import { convertStorageFormat } from './converter.js';
@@ -19,12 +21,17 @@ import {
 import { log } from './log.js';
 import { htmlPathFor } from './pathing.js';
 import {
+  appendIndexEntry,
+  buildTree,
   emptyState,
+  finalizeIndex,
   findExistingIndexFile,
   indexFileName,
+  jsonlPathFromIndexPath,
   readIndex,
   type StateFile,
-  writeIndex,
+  treePathFromIndexPath,
+  writeTree,
 } from './state.js';
 import { buildCQL } from './walker.js';
 
@@ -116,9 +123,21 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
     );
   }
 
+  // Cap derived from autotuned config or a CPU-based fallback. The adaptive
+  // limiter starts at 1 (slow-start), doubles every 50 successes up to this
+  // cap, halves on every 429, and honours Retry-After as a rate cap.
+  const parallelCap =
+    config.parallel_downloads ?? Math.min(50, Math.max(4, (cpus()?.length ?? 4) * 2));
+  const adaptiveLimiter = new AdaptiveLimiter({ max: parallelCap, slowStart: true });
+  log.info(
+    { maxConcurrency: parallelCap, startingConcurrency: adaptiveLimiter.currentCapacity },
+    `adaptive concurrency: starting at ${adaptiveLimiter.currentCapacity}, ramping toward ${parallelCap} on sustained success`,
+  );
+
   const client = new ConfluenceClient({
     baseUrl: config.base_url,
     pat: config.pat,
+    rateLimitObserver: adaptiveLimiter,
   });
 
   // Load (or initialise) one index per configured root.
@@ -210,7 +229,12 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
         pagesWithChildren,
         titleIndex,
         rootPageIds,
-        flushState: () => writeIndex(root.indexPath, root.state),
+        limiter: adaptiveLimiter,
+        // Cheap per-page persistence: append one line to the sibling .jsonl
+        // instead of re-serialising the whole .json. The .json is rewritten
+        // (and the .jsonl deleted) at finalizeIndex below.
+        flushState: (id: string) =>
+          appendIndexEntry(jsonlPathFromIndexPath(root.indexPath), id, root.state.pages[id]!),
       },
       syncIso,
     );
@@ -264,7 +288,13 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
       );
     }
     root.state.total_pages_downloaded = Object.keys(root.state.pages).length;
-    await writeIndex(root.indexPath, root.state);
+    // Collapse the per-page .jsonl into a fresh .json snapshot and delete
+    // the .jsonl. Interrupted runs leave the .jsonl around for next-run
+    // recovery; finalize wipes it because the .json now has everything.
+    await finalizeIndex(root.indexPath, root.state);
+    // Write the per-root tree.json for human navigation via IDE folding.
+    const tree = buildTree(root.state);
+    if (tree) await writeTree(treePathFromIndexPath(root.indexPath), tree);
 
     // Per-root attribution + accumulate into totals.
     const writtenSet = new Set(result.written);
@@ -321,6 +351,26 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
       ...(allErrors > 0 ? { errorSummary: allErrorSummary } : {}),
     },
     headline,
+  );
+
+  // Throttle stats — "of N HTTP requests, M had to back off." Useful to gauge
+  // whether parallel_downloads is set too high for the server.
+  const total = client.totalRequests;
+  const recovered = client.requestsRecoveredAfterBackoff;
+  const failedAfterRetries = client.requestsFailedAfterRetries;
+  if (recovered > 0 || failedAfterRetries > 0) {
+    const pct = total > 0 ? Math.round((recovered / total) * 100) : 0;
+    const failedNote = failedAfterRetries > 0 ? `; ${failedAfterRetries} gave up after the retry budget` : '';
+    log.info(
+      { totalRequests: total, recoveredAfterBackoff: recovered, failedAfterRetries },
+      `throttle: ${recovered} of ${total} requests (${pct}%) had to back off and retry${failedNote}`,
+    );
+  }
+
+  // Adaptive limiter — where did it end up?
+  log.info(
+    { finalConcurrency: adaptiveLimiter.currentCapacity, maxConcurrency: adaptiveLimiter.maxCapacity },
+    `adaptive concurrency settled at ${adaptiveLimiter.currentCapacity} of ${adaptiveLimiter.maxCapacity} max`,
   );
 
   // Bench recap if autotune ran this turn.

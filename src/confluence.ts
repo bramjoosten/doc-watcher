@@ -3,6 +3,10 @@ import { log } from './log.js';
 export interface ConfluenceClientOptions {
   baseUrl: string;
   pat: string;
+  // Optional observer notified once per 429-wave (when the cooldown was not
+  // already active). Used by the adaptive limiter to halve concurrency and
+  // honour Retry-After as a rate cap.
+  rateLimitObserver?: { report429: (retryAfterMs: number) => void };
 }
 
 export interface PageVersion {
@@ -62,9 +66,19 @@ export class ConfluenceClient {
   // turning a single 429 into a cascading storm.
   private throttledUntilMs = 0;
 
+  // Aggregate request-level retry stats. Reset implicitly each runSync by
+  // virtue of constructing a new client per run. Exposed so taskmanager can
+  // log "of N requests, M had to back off" at end of sync.
+  public totalRequests = 0;
+  public requestsRecoveredAfterBackoff = 0;
+  public requestsFailedAfterRetries = 0;
+
+  private readonly rateLimitObserver?: ConfluenceClientOptions['rateLimitObserver'];
+
   constructor(opts: ConfluenceClientOptions) {
     this.baseUrl = opts.baseUrl.replace(/\/$/, '');
     this.pat = opts.pat;
+    this.rateLimitObserver = opts.rateLimitObserver;
   }
 
   // Parse a Retry-After header. Confluence returns either a seconds count or
@@ -85,6 +99,7 @@ export class ConfluenceClient {
   // Bumped from 5 to 8 to handle sustained throttle storms where the server keeps
   // issuing Retry-After's faster than one request can ride them out.
   private async fetchWithRetry(url: string, init: RequestInit): Promise<Response> {
+    this.totalRequests++;
     let attempt = 0;
     let backedOff = false;
     // For readability in logs, trim the base URL from request URLs.
@@ -98,6 +113,7 @@ export class ConfluenceClient {
       const res = await fetch(url, init);
       if (res.status !== 429 && res.status !== 503) {
         if (backedOff && res.ok) {
+          this.requestsRecoveredAfterBackoff++;
           log.info(
             { url: shortUrl, attempts: attempt + 1 },
             `recovered after backoff: ${shortUrl} succeeded on attempt ${attempt + 1}`,
@@ -105,7 +121,10 @@ export class ConfluenceClient {
         }
         return res;
       }
-      if (attempt >= 8) return res;
+      if (attempt >= 8) {
+        if (backedOff) this.requestsFailedAfterRetries++;
+        return res;
+      }
       backedOff = true;
 
       // Read the body up-front: it usually carries Confluence's actual
@@ -126,6 +145,7 @@ export class ConfluenceClient {
           { status: res.status, url: shortUrl, attempt: attempt + 1, waitMs, body: bodySnippet || undefined },
           `rate limited (${res.status} ${res.statusText}) for ${shortUrl}: ${bodySnippet || '(no body)'} — backing off ${waitMs}ms`,
         );
+        this.rateLimitObserver?.report429(waitMs);
       }
       await new Promise<void>((r) => setTimeout(r, waitMs));
       attempt++;
