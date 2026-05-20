@@ -263,12 +263,10 @@ export async function downloadPages(pages: ConfluencePage[], opts: DownloadOptio
   const written: string[] = [];
   const attachments: string[] = [];
   const errors: { id: string; error: unknown }[] = [];
-  // Periodic progress: log every Nth successful page, AND at least every M
-  // seconds, whichever fires first. Heavy throttling can drop the success rate
-  // below 100/run, so a pure count threshold can leave the user staring at
-  // backoff warnings without any "yes we're making progress" feedback.
-  const PROGRESS_EVERY = 50;
-  const PROGRESS_INTERVAL_MS = 30_000;
+  // Periodic progress: time-based, every PROGRESS_INTERVAL_MS. Count-based
+  // reporting added noise without much signal — the time floor alone gives a
+  // reliable heartbeat regardless of throughput.
+  const PROGRESS_INTERVAL_MS = 10_000;
   let lastProgressAt = Date.now();
   const total = pages.length;
 
@@ -299,12 +297,10 @@ export async function downloadPages(pages: ConfluencePage[], opts: DownloadOptio
           opts.state.total_pages_downloaded = Object.keys(opts.state.pages).length;
 
           const now = Date.now();
-          const hitCount = written.length % PROGRESS_EVERY === 0;
-          const hitTime = now - lastProgressAt >= PROGRESS_INTERVAL_MS;
-          if (hitCount || hitTime) {
+          if (now - lastProgressAt >= PROGRESS_INTERVAL_MS) {
             log.info(
-              { downloaded: written.length, of: total, lastId: detailed.id, lastTitle: detailed.title },
-              `progress: ${written.length} of ${total} downloaded (last: ${detailed.id} — ${detailed.title})`,
+              { downloaded: written.length, of: total },
+              `progress: ${written.length} of ${total} downloaded`,
             );
             lastProgressAt = now;
           }
