@@ -34,6 +34,10 @@ Incremental sync — the first invocation downloads everything, every later run 
 npm start -- --walkdb     # recursive /child/page walk — slower, but sees new pages immediately
 ```
 
+## What it doesn't mirror
+
+**Attachments are out of scope.** Inline images, PDFs, diagrams, decks — none of it lands on disk. The page bodies still reference them (image hrefs in the rendered markdown point at the live Confluence `/download/attachments/...` URL), so they display when viewed on a network with access to your Confluence, but nothing gets cached locally. Reasons: attachment downloads dominate bandwidth for any non-trivial space, the on-disk corpus would balloon by orders of magnitude, and the use cases we built doc-watcher for (search, AI tooling, grep) operate on text. If you need a particular attachment, click through to Confluence.
+
 ## Other verbs
 
 - `npm start -- refresh` — full re-download (ignores `last_sync`, reconciles deletes). Accepts `--walkdb`.

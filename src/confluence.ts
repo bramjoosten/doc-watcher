@@ -53,14 +53,6 @@ export interface ConfluencePage {
   _links?: { webui?: string; self?: string; base?: string };
 }
 
-export interface ConfluenceAttachment {
-  id: string;
-  title: string;
-  version?: PageVersion;
-  extensions?: { mediaType?: string; fileSize?: number };
-  _links?: { download?: string };
-}
-
 interface ConfluenceListResponse<T> {
   results: T[];
   start: number;
@@ -203,17 +195,6 @@ export class ConfluenceClient {
     return (await res.json()) as T;
   }
 
-  private async requestBinary(path: string): Promise<ArrayBuffer> {
-    const url = path.startsWith('http') ? path : `${this.baseUrl}${path}`;
-    const res = await this.fetchWithRetry(url, {
-      headers: { Authorization: `Bearer ${this.pat}` },
-    });
-    if (!res.ok) {
-      throw new Error(`Confluence binary fetch failed: ${res.status} ${res.statusText} ${url}`);
-    }
-    return await res.arrayBuffer();
-  }
-
   async *paginate<T>(initialPath: string): AsyncGenerator<T> {
     let next: string | null = initialPath;
     while (next) {
@@ -287,16 +268,4 @@ export class ConfluenceClient {
     return out;
   }
 
-  async getAttachments(pageId: string): Promise<ConfluenceAttachment[]> {
-    const path = `/rest/api/content/${encodeURIComponent(pageId)}/child/attachment?expand=version&limit=100`;
-    const out: ConfluenceAttachment[] = [];
-    for await (const item of this.paginate<ConfluenceAttachment>(path)) {
-      out.push(item);
-    }
-    return out;
-  }
-
-  async downloadAttachment(downloadPath: string): Promise<ArrayBuffer> {
-    return this.requestBinary(downloadPath);
-  }
 }

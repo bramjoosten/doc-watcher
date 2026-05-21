@@ -43,17 +43,6 @@ export function htmlPathFor(mdPath: string): string {
   return mdPath.replace(/\.md$/, '.html');
 }
 
-export function attachmentPath(spaceKey: string, pageId: string, filename: string): string {
-  return posix.join(spaceKey, 'attachments', pageId, filename);
-}
-
-export function attachmentRelativeForPage(pageRelPath: string, spaceKey: string, pageId: string, filename: string): string {
-  // Build a relative href from the page's location to the attachment file.
-  const pageDir = posix.dirname(pageRelPath);
-  const target = attachmentPath(spaceKey, pageId, filename);
-  return posix.relative(pageDir, target) || filename;
-}
-
 // Walk up from the directory containing `removedFilePath` and rmdir each
 // directory that has become empty, stopping at the first non-empty one or
 // when we reach `stopAt` (the configured output dir). Used after deleting

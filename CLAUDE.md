@@ -23,7 +23,7 @@ Node.js 24, TypeScript, run directly via Node's built-in type stripping — no t
 ### Stack
 
 - **Node 24+** with **TypeScript**. Node strips TS types natively (stable from 22.18 / on by default from 23.6), so we run `node src/taskmanager.ts` directly — no `tsx`, no `esbuild`, no build step. `.nvmrc` pins to `24`.
-- Built-in `fetch` (undici, bundled with Node); a 15-line inline `pLimit` helper for bounded-concurrency parallel downloads.
+- Built-in `fetch` (undici, bundled with Node). Concurrency goes through `src/adaptive-limiter.ts` — a small in-house slow-start + AIMD limiter that reacts to Confluence's `X-RateLimit-*` headers, so there's no external rate-limit library.
 - `cheerio` for parsing Confluence storage-format XHTML.
 - In-house HTML→Markdown walker in `converter.ts` (no `turndown` — DOM-lib transitive deps kept tripping corp security scanners).
 - `zod` for typed config validation.
@@ -70,7 +70,7 @@ doc-watcher/
     ├── config.ts                   # zod schema, YAML loader
     ├── confluence.ts               # REST client (typed wrappers around fetch)
     ├── walker.ts                   # subtree enumeration: CQL fast path + /child/page DB walk
-    ├── downloader.ts               # parallel fetch + write, p-limit-bounded
+    ├── downloader.ts               # parallel fetch + write, gated by the adaptive limiter
     ├── converter.ts                # storage-format → markdown: cheerio macro pre-pass + in-house walker
     ├── pathing.ts                  # title → slug, rename detection
     ├── adaptive-limiter.ts         # slow-start + AIMD + budget-aware concurrency
@@ -92,7 +92,6 @@ docs/
       _index.html / _index.md             #   the page itself; ID is in folder name
       setup-guide--99999.html             # leaf child — raw storage format
       setup-guide--99999.md               # leaf child — converted markdown
-    attachments/<page_id>/diagram.png
 ```
 
 **Filename rule.** Each page produces two files side-by-side: `<slug>--<id>.html` (raw Confluence storage format) and `<slug>--<id>.md` (derived markdown). Slug is the lowercase, kebab-cased, ASCII-folded page title. The `--<id>` suffix is the durable anchor — if the state file is ever lost, files can still be matched back to their Confluence pages by ID alone.
@@ -128,8 +127,6 @@ Fast (one paginated call covers ~100 pages per request) and good enough for the 
 - `GET /rest/api/content/search?cql=...&expand=version,space,ancestors&limit=100` — default subtree enumeration via CQL/Lucene. Paginated.
 - `GET /rest/api/content/{id}/child/page?expand=version&limit=100` — direct children of a page (DB-backed, bypasses Lucene). Called recursively through the subtree by the `--walkdb` path in `walker.ts`.
 - `GET /rest/api/content/{id}?expand=body.storage,version,ancestors,space` — full page (storage-format XHTML). Also used to fetch the root page itself in `--walkdb` mode.
-- `GET /rest/api/content/{id}/child/attachment?expand=version` — attachment list.
-- `GET /download/attachments/{pageId}/{filename}` — binary download.
 
 Auth: `Authorization: Bearer <pat from config.ts>` on every request.
 
@@ -137,7 +134,7 @@ TLS certificate verification is disabled process-wide (`NODE_TLS_REJECT_UNAUTHOR
 
 ### Converter
 
-Confluence "storage format" is XHTML with `<ac:structured-macro>` extensions. A pre-pass with cheerio rewrites macros to plain HTML, then an in-house walker emits markdown. A registry of macro handlers covers code blocks, callouts (info/warning/note), images and attachments, internal links, iframes/embeds, status badges, task lists, user mentions, and emoticons. Unknown macros become HTML comments — visible but inert. The walker handles the standard HTML tag set (p, h1–h6, ul/ol/li with nesting, strong/em/code, pre+code with language hint, a, img, blockquote with our callout data attribute, GFM tables, hr, br).
+Confluence "storage format" is XHTML with `<ac:structured-macro>` extensions. A pre-pass with cheerio rewrites macros to plain HTML, then an in-house walker emits markdown. A registry of macro handlers covers code blocks, callouts (info/warning/note), inline images, internal links, iframes/embeds, status badges, task lists, user mentions, and emoticons. Image hrefs point at the live Confluence `/download/attachments/...` URL — we don't mirror attachment bodies (out of scope). Unknown macros become HTML comments — visible but inert. The walker handles the standard HTML tag set (p, h1–h6, ul/ol/li with nesting, strong/em/code, pre+code with language hint, a, img, blockquote with our callout data attribute, GFM tables, hr, br).
 
 Always deterministic, always replayable. The `.html` file on disk is what the converter ran against; given the same HTML and the same converter version, you get the same `.md`.
 
@@ -161,10 +158,9 @@ On top of that reactive AIMD, the client reads Confluence DC's `X-RateLimit-*` h
 
 The HTTP client also retries 429/503 with exponential backoff (up to 8 attempts, max 60 s per wait, `Retry-After` honoured) as a fallback for when budget signals arrive too late or are missing. The retry uses a **client-wide cooldown**: when any one in-flight request gets rate-limited, the wait window is broadcast to every other in-flight request via a shared `throttledUntilMs` on the client. Without that, parallel retries pile back onto the throttled server and turn a single 429 into a cascading storm even at low concurrency.
 
-No explicit autotune step: with budget headers driving the rate, an upfront benchmark adds no information the limiter can't discover live. The ceiling is just a config knob (default 20); the limiter does the rest.
-
 ## Out of scope (for now)
 
+- Attachments. Inline images, PDFs, diagrams, decks — none of it is mirrored. Image hrefs in the rendered markdown point at the live Confluence `/download/attachments/...` URL so they display when you view the file on a network with access to the server, but no bytes are cached locally. Reason: attachments dominate bandwidth and disk for any non-trivial space, and the use cases we care about (search, AI tooling, grep) operate on text.
 - Webhooks. Confluence Server webhooks need admin-level configuration; we only have a user PAT. Polling is enough.
 - Adapter abstractions for multiple sources (Notion, Confluence Cloud, etc.). Left as a one-source codebase until a second source actually exists.
 - Write-back and conflict handling. See nice-to-haves above.

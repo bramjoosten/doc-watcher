@@ -24,12 +24,6 @@ export default {
   // doc-watcher source getting in the way.
   output_dir: '../docs',
 
-  // Inline images referenced via ac:image macros. Set to true once you've
-  // gauged bandwidth on a small first sync — a space with diagrams can
-  // easily push tens of GB. Non-inline file attachments (PDFs, decks, etc.)
-  // are not mirrored either way.
-  include_attachments: false,
-
   // Confluence page id(s) whose subtree(s) to mirror. One id or a list:
   //   root_page_ids: '123456',
   //   root_page_ids: ['123456', '234567'],

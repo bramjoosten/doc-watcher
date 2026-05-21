@@ -2,17 +2,10 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join, posix } from 'node:path';
 import { AdaptiveLimiter } from './adaptive-limiter.ts';
 import type { Config } from './config.ts';
-import type { ConfluenceAttachment, ConfluenceClient, ConfluencePage } from './confluence.ts';
+import type { ConfluenceClient, ConfluencePage } from './confluence.ts';
 import { convertStorageFormat } from './converter.ts';
 import { log } from './log.ts';
-import {
-  attachmentPath,
-  attachmentRelativeForPage,
-  folderIndexPath,
-  htmlPathFor,
-  leafPath,
-  spaceIndexPath,
-} from './pathing.ts';
+import { folderIndexPath, htmlPathFor, leafPath, spaceIndexPath } from './pathing.ts';
 import type { PageState, StateFile } from './state.ts';
 
 export interface DownloadOptions {
@@ -40,7 +33,6 @@ export interface DownloadOptions {
 
 export interface DownloadResult {
   written: string[];
-  attachments: string[];
   errors: { id: string; error: unknown }[];
 }
 
@@ -160,9 +152,18 @@ export function buildConvertOptions(args: {
   titleIndex: Map<string, string>;
 }): Parameters<typeof convertStorageFormat>[1] {
   const { pageId, pagePath, pageSpace, baseUrl, state, knownPagePaths, titleIndex } = args;
+  // pagePath/pageSpace currently only relevant for attachment hrefs, which
+  // we now render as absolute Confluence URLs instead of local paths.
+  void pagePath;
+  void pageSpace;
   return {
     pageId,
-    resolveImage: (filename: string) => attachmentRelativeForPage(pagePath, pageSpace, pageId, filename),
+    // Attachments are out of scope: we don't download them, but we still
+    // need to render image hrefs in the markdown. Point them at the live
+    // Confluence download URL so they at least resolve when viewed on a
+    // network with access to the server.
+    resolveImage: (filename: string) =>
+      `${baseUrl.replace(/\/$/, '')}/download/attachments/${pageId}/${encodeURIComponent(filename)}`,
     resolvePageLink: (ref) => {
       const targetSpace = ref.spaceKey ?? pageSpace;
       const targetId = titleIndex.get(titleIndexKey(targetSpace, ref.contentTitle));
@@ -182,17 +183,10 @@ async function fetchAndWriteOne(
   opts: DownloadOptions,
   limiter: AdaptiveLimiter,
   syncIso: string,
-): Promise<{ relPath: string; attachments: string[] }> {
+): Promise<{ relPath: string }> {
   const spaceKey = page.space?.key ?? 'UNKNOWN';
   const relPath = pickPageRelPath(page, opts.pagesWithChildren, opts.rootPageIds);
   const absPath = join(opts.outputDir, relPath);
-
-  const attachmentRefs: string[] = [];
-  const wantAttachments = opts.config.include_attachments;
-
-  const attachments: ConfluenceAttachment[] = wantAttachments ? await opts.client.getAttachments(page.id) : [];
-  const attachmentByName = new Map<string, ConfluenceAttachment>();
-  for (const a of attachments) attachmentByName.set(a.title, a);
 
   const html = page.body?.storage?.value ?? '';
   const conversion = convertStorageFormat(
@@ -207,29 +201,6 @@ async function fetchAndWriteOne(
       titleIndex: opts.titleIndex,
     }),
   );
-
-  if (wantAttachments) {
-    await Promise.all(
-      conversion.images.map((img) =>
-        limiter.wrap(async () => {
-          const att = attachmentByName.get(img.filename);
-          if (!att) return;
-          const downloadHref = att._links?.download;
-          if (!downloadHref) return;
-          const dest = join(opts.outputDir, attachmentPath(spaceKey, page.id, img.filename));
-          try {
-            const buf = await opts.client.downloadAttachment(downloadHref);
-            await mkdir(dirname(dest), { recursive: true });
-            await writeFile(dest, Buffer.from(buf));
-            attachmentRefs.push(attachmentPath(spaceKey, page.id, img.filename));
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            log.warn(`attachment download failed for ${img.filename} (page ${page.id}): ${msg}`);
-          }
-        }),
-      ),
-    );
-  }
 
   // Write the raw storage-format HTML next to the .md so reconvert can rebuild the
   // markdown later without re-hitting Confluence.
@@ -249,16 +220,16 @@ async function fetchAndWriteOne(
   await writeFile(htmlAbsPath, html, 'utf8');
   await writeFile(absPath, mdBody, 'utf8');
 
-  // Quiet "unused" hint — syncIso is part of the public signature for future fields.
+  // Quiet "unused" hint — these args are kept for parity / future fields.
+  void limiter;
   void syncIso;
 
-  return { relPath, attachments: attachmentRefs };
+  return { relPath };
 }
 
 export async function downloadPages(pages: ConfluencePage[], opts: DownloadOptions, syncIso: string): Promise<DownloadResult> {
   const limiter = opts.limiter;
   const written: string[] = [];
-  const attachments: string[] = [];
   const errors: { id: string; error: unknown }[] = [];
   // Periodic progress: time-based, every PROGRESS_INTERVAL_MS. Count-based
   // reporting added noise without much signal — the time floor alone gives a
@@ -274,7 +245,6 @@ export async function downloadPages(pages: ConfluencePage[], opts: DownloadOptio
           const detailed = page.body?.storage ? page : await opts.client.getPage(page.id);
           const result = await fetchAndWriteOne(detailed, opts, limiter, syncIso);
           written.push(result.relPath);
-          attachments.push(...result.attachments);
           // Update state in place.
           const detailedSpace = detailed.space?.key ?? 'UNKNOWN';
           opts.state.pages[detailed.id] = {
@@ -321,5 +291,5 @@ export async function downloadPages(pages: ConfluencePage[], opts: DownloadOptio
     ),
   );
 
-  return { written, attachments, errors };
+  return { written, errors };
 }

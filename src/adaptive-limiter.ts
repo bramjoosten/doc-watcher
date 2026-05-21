@@ -1,7 +1,7 @@
 // Adaptive bounded-concurrency limiter with slow-start, Retry-After rate cap,
 // and proactive budget-aware throttling.
 //
-// Replaces a fixed p-limit during real sync. Behaviour:
+// Behaviour:
 //  - Starts at capacity = 1 (slow-start) and doubles every N successful runs
 //    until reaching `max`. Avoids the cold-cliff problem where firing N
 //    requests at sync start triggers a 429 wave the server then takes

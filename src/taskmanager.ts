@@ -141,7 +141,6 @@ async function runSync(opts: { full: boolean; walkDb: boolean }): Promise<void> 
   let allDownloaded = 0;
   let allCandidates = 0;
   let allSkipped = 0;
-  let allAttachments = 0;
   let allErrors = 0;
   const allErrorSummary: Record<string, number> = {};
 
@@ -258,7 +257,6 @@ async function runSync(opts: { full: boolean; walkDb: boolean }): Promise<void> 
     allCandidates += seen.size;
     allSkipped += seen.size - remaining.length;
     allDownloaded += result.written.length;
-    allAttachments += result.attachments.length;
     allErrors += result.errors.length;
     allAdded += addedCount;
     allUpdated += updatedCount;

@@ -18,7 +18,6 @@ export const configSchema = z.object({
   base_url: z.string().url(),
   pat: z.string().min(1, 'pat is required — paste your Confluence PAT'),
   output_dir: z.string().default('./docs').transform(expandTilde),
-  include_attachments: z.boolean().default(false),
   root_page_ids: z
     .union([z.string().min(1), z.array(z.string().min(1)).min(1)])
     .transform((v) => (Array.isArray(v) ? v : [v])),
