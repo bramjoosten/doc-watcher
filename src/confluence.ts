@@ -237,30 +237,6 @@ export class ConfluenceClient {
     }
   }
 
-  async searchByCQL(cql: string, expand: string[] = ['version']): Promise<ConfluencePage[]> {
-    const params = new URLSearchParams();
-    params.set('cql', cql);
-    params.set('limit', '100');
-    if (expand.length) params.set('expand', expand.join(','));
-    const path = `/rest/api/content/search?${params.toString()}`;
-    const out: ConfluencePage[] = [];
-    log.info({ cql }, 'asking Confluence for the list of pages in scope — this can take a while for big subtrees');
-    const started = Date.now();
-    for await (const item of this.paginate<ConfluencePage>(path)) {
-      out.push(item);
-      // Pagination batches are 100 (limit param). Log every batch so the user
-      // sees progress instead of a silent hang.
-      if (out.length % 100 === 0) {
-        log.info({ pagesListed: out.length, elapsedMs: Date.now() - started }, `${out.length} pages listed so far`);
-      }
-    }
-    log.info(
-      { cql, total: out.length, elapsedMs: Date.now() - started },
-      `Confluence returned ${out.length} pages in ${Date.now() - started}ms`,
-    );
-    return out;
-  }
-
   async getPage(
     id: string,
     expand: string[] = ['body.storage', 'version', 'ancestors', 'space'],
@@ -270,6 +246,33 @@ export class ConfluenceClient {
     if (expand.length) params.set('expand', expand.join(','));
     const path = `/rest/api/content/${encodeURIComponent(id)}?${params.toString()}`;
     return this.request<ConfluencePage>(path, undefined, opts);
+  }
+
+  // Enumerate every descendant of a page via Confluence's DB-backed
+  // ancestor-relationship endpoint. Unlike `/rest/api/content/search`
+  // (which uses the Lucene index and may not see pages that haven't
+  // been indexed yet), this hits the content table directly — so
+  // newly-created pages show up immediately, regardless of whether
+  // the background indexer has caught up.
+  async getDescendantPages(pageId: string, expand: string[] = ['version']): Promise<ConfluencePage[]> {
+    const params = new URLSearchParams();
+    params.set('limit', '100');
+    if (expand.length) params.set('expand', expand.join(','));
+    const path = `/rest/api/content/${encodeURIComponent(pageId)}/descendant/page?${params.toString()}`;
+    const out: ConfluencePage[] = [];
+    log.info({ pageId }, 'enumerating descendants via /descendant/page (DB-backed, bypasses Lucene)');
+    const started = Date.now();
+    for await (const item of this.paginate<ConfluencePage>(path)) {
+      out.push(item);
+      if (out.length % 100 === 0) {
+        log.info({ pagesListed: out.length, elapsedMs: Date.now() - started }, `${out.length} descendants listed so far`);
+      }
+    }
+    log.info(
+      { pageId, total: out.length, elapsedMs: Date.now() - started },
+      `Confluence returned ${out.length} descendants in ${Date.now() - started}ms`,
+    );
+    return out;
   }
 
   async getAttachments(pageId: string): Promise<ConfluenceAttachment[]> {

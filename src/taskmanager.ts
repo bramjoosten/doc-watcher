@@ -31,7 +31,6 @@ import {
   treePathFromIndexPath,
   writeTree,
 } from './state.js';
-import { buildCQL } from './walker.js';
 
 // Default cap when the user hasn't set parallel_downloads in config.yaml.
 // The adaptive limiter starts at 1 anyway and ramps based on observed
@@ -159,10 +158,18 @@ async function runSync(opts: { full: boolean }): Promise<void> {
   const allErrorSummary: Record<string, number> = {};
 
   for (const root of roots) {
-    const cql = buildCQL(root.rootId);
-    log.info({ rootId: root.rootId, title: root.title, cql }, `syncing root "${root.title}" (${root.rootId})`);
+    log.info({ rootId: root.rootId, title: root.title }, `syncing root "${root.title}" (${root.rootId})`);
 
-    const results = await client.searchByCQL(cql, ['version', 'space', 'ancestors']);
+    // Enumerate via /descendant/page (DB-backed) plus a direct fetch of the
+    // root itself. We deliberately avoid /rest/api/content/search (CQL) here:
+    // that endpoint goes through Lucene and silently skips pages the search
+    // index hasn't indexed yet — including freshly-created ones on instances
+    // where the background indexer is behind or unhealthy.
+    const [rootPage, descendants] = await Promise.all([
+      client.getPage(root.rootId, ['version', 'space', 'ancestors']),
+      client.getDescendantPages(root.rootId, ['version', 'space', 'ancestors']),
+    ]);
+    const results = [rootPage, ...descendants];
     const seen = new Map<string, (typeof results)[number]>();
     for (const r of results) seen.set(r.id, r);
 

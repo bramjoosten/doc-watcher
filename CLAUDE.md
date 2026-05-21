@@ -41,9 +41,9 @@ The top of each index opens with a self-describing `description` string so anyon
 
 Filename uses `--<root_id>` as the durable anchor — a root-title change just renames the file but leaves the index discoverable by id. Discovery is by glob (`index-*--<root_id>.json`); whoever owns the index wins.
 
-State is **flushed after every successful page write** during a sync, not just at the end. So an interrupt (Ctrl+C, crash, network failure) leaves the state file reflecting exactly the pages already on disk. The next `npm start` re-queries the same CQL window (last_sync doesn't advance until the sync completes), diffs against the persisted per-page versions, and only fetches the pages not yet recorded. Resume is automatic — no `--resume` flag, no special verb.
+State is **flushed after every successful page write** during a sync, not just at the end. So an interrupt (Ctrl+C, crash, network failure) leaves the state file reflecting exactly the pages already on disk. The next `npm start` re-enumerates the full subtree, diffs against the persisted per-page versions, and only fetches the pages not yet recorded. Resume is automatic — no `--resume` flag, no special verb.
 
-**Failed pages get retried automatically on the next run.** `last_sync` only advances when a run completes with zero per-page errors. Any failure (exhausted 429 backoff, 4xx other than rate-limit, 5xx, network errors) keeps `last_sync` frozen at its previous value, so the next CQL window covers the same set of pages. Successful pages from prior runs are skipped via the version diff (`state.pages[id].version === current`); the failed ones — which have no `state.pages` entry — fall back into `toFetch` and get re-attempted. No separate retry queue or `failed_ids` list to maintain.
+**Failed pages get retried automatically on the next run.** `last_sync` only advances when a run completes with zero per-page errors. Any failure (exhausted 429 backoff, 4xx other than rate-limit, 5xx, network errors) keeps `last_sync` frozen at its previous value. Successful pages from prior runs are skipped via the version diff (`state.pages[id].version === current`); the failed ones — which have no `state.pages` entry — fall back into `toFetch` and get re-attempted. No separate retry queue or `failed_ids` list to maintain.
 
 JSON over SQLite is deliberate: doc-watcher is single-process and the whole state is small (a few hundred KB even for 10k pages), so the durability and concurrency advantages of an embedded DB don't pay back the cost of a native dependency that may not install on locked-down corporate machines.
 
@@ -68,7 +68,6 @@ doc-watcher/
     ├── taskmanager.ts              # entry point: sync / refresh / reconvert
     ├── config.ts                   # zod schema, YAML loader
     ├── confluence.ts               # REST client (typed wrappers around fetch)
-    ├── walker.ts                   # expand root_page_ids → page id list (CQL)
     ├── downloader.ts               # parallel fetch + write, p-limit-bounded
     ├── converter.ts                # storage-format → markdown: cheerio macro pre-pass + in-house walker
     ├── pathing.ts                  # title → slug, rename detection
@@ -104,22 +103,21 @@ docs/
 
 ### Change detection
 
-Confluence Server has no dedicated sync endpoint, but CQL on `/rest/api/content/search` is enough:
+Confluence Server has no dedicated sync endpoint. We enumerate each configured root via two paginated calls per root, both DB-backed:
 
-```
-(id = 12345 OR ancestor = 12345) AND type = page
-```
+- `GET /rest/api/content/{rootId}?expand=version,space,ancestors` — the root page itself.
+- `GET /rest/api/content/{rootId}/descendant/page?expand=version,space,ancestors` — every descendant in the subtree.
 
-Every run enumerates the full subtree of each configured root via this single CQL, with `expand=version,space,ancestors` (no body) — cheap, ~1 request per 100 pages. The per-page `version` returned by Confluence is then diffed against the index: pages with a higher version (or no entry in state) get fetched with `expand=body.storage`; everything else is skipped. New pages, edits, renames, re-parents and deletes all fall out of this single mechanism.
+The per-page `version` returned by Confluence is then diffed against the local index: pages with a higher version (or no entry in state) get fetched with `expand=body.storage`; everything else is skipped. New pages, edits, renames, re-parents and deletes all fall out of this single mechanism.
 
-**Why not narrow by `lastmodified`?** An earlier design appended `AND lastmodified >= "<last_sync>"` to keep the result set tiny on incremental runs. We dropped it: in practice the field doesn't reliably reflect page creation on Confluence Server (newly created pages were silently missed on every incremental run until a daily full enumeration caught them, then they showed up with no body if the user hadn't run `refresh`). Always-full enumeration trades a small amount of metadata pagination for correctness — and the per-page version diff still keeps actual downloads minimal.
+**Why `/descendant/page` and not CQL?** We previously enumerated via `/rest/api/content/search` (CQL: `(id = N OR ancestor = N) AND type = page`). CQL is fast but routes through Confluence's Lucene search index, which can lag the database — and on instances with an unhealthy background indexer, brand-new pages may not appear in the index at all (which also makes them invisible to the in-app search bar). `/descendant/page` walks the persisted parent-ancestor relationship table directly, so newly-created pages show up immediately, regardless of whether the search index has caught up. The cost is similar (~1 request per 100 descendants, no body expansion).
 
-**Deletes.** A page that's been deleted or archived in Confluence disappears from the full enumeration. Anything in the local index but not in the latest enumeration falls into the orphan set; both its `.html` and `.md` are removed from disk and the state entry is dropped.
+**Deletes.** A page that's been deleted or archived in Confluence disappears from the descendant listing. Anything in the local index but not in the latest enumeration falls into the orphan set; both its `.html` and `.md` are removed from disk and the state entry is dropped.
 
 ### Confluence REST endpoints used
 
-- `GET /rest/api/content/search?cql=...&limit=100&expand=version` — list pages, with paging.
-- `GET /rest/api/content/{id}?expand=body.storage,version,ancestors,space` — full page (storage-format XHTML).
+- `GET /rest/api/content/{id}/descendant/page?expand=version,space,ancestors&limit=100` — every page in the subtree (DB-backed, bypasses Lucene). Paginated.
+- `GET /rest/api/content/{id}?expand=body.storage,version,ancestors,space` — full page (storage-format XHTML). Also used to fetch the root page itself.
 - `GET /rest/api/content/{id}/child/attachment?expand=version` — attachment list.
 - `GET /download/attachments/{pageId}/{filename}` — binary download.
 
@@ -139,7 +137,7 @@ Always deterministic, always replayable. The `.html` file on disk is what the co
 
 Verbs:
 
-- **`sync`** (default): enumerate the full subtree via CQL (`expand=version,space,ancestors`, no body), diff each page's version against state, fetch any new-or-changed pages in parallel, write both `.html` and `.md`, atomic state-file replace at the end.
+- **`sync`** (default): enumerate the full subtree via `/rest/api/content/{rootId}/descendant/page` plus a direct fetch of the root (`expand=version,space,ancestors`, no body), diff each page's version against state, fetch any new-or-changed pages in parallel, write both `.html` and `.md`, atomic state-file replace at the end.
 - **`refresh`**: same as `sync` but ignores `last_sync` (full re-download).
 - **`reconvert`**: walk every `.html` already on disk and regenerate the `.md` next to it. No network calls. Used after a converter change.
 
@@ -157,6 +155,6 @@ No explicit autotune step: with budget headers driving the rate, an upfront benc
 
 ## Out of scope (for now)
 
-- Webhooks. Confluence Server webhooks need admin-level configuration; we only have a user PAT. CQL polling is enough.
+- Webhooks. Confluence Server webhooks need admin-level configuration; we only have a user PAT. Polling is enough.
 - Adapter abstractions for multiple sources (Notion, Confluence Cloud, etc.). Left as a one-source codebase until a second source actually exists.
 - Write-back and conflict handling. See nice-to-haves above.

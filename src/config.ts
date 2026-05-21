@@ -30,8 +30,6 @@ export const configSchema = z.object({
 });
 
 export type Config = z.infer<typeof configSchema>;
-// A page-id string — the unit a planScope / fetchAndWriteOne operates on.
-export type WatchEntry = string;
 
 export interface LoadedConfig {
   config: Config;
