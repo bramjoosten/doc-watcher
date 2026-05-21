@@ -417,7 +417,34 @@ const walkDb = flags.includes('--walkdb');
       process.exit(1);
   }
 })().catch((err) => {
-  const msg = err instanceof Error ? (err.stack ?? err.message) : String(err);
-  log.error(`cli error: ${msg}`);
+  // Print the error and any `cause` chain (undici stacks DNS/TCP/TLS
+  // failures under .cause as a TypeError("fetch failed") wrapper). For
+  // error paths we deliberately ignore the "one-line logs" convention —
+  // structured detail (code, syscall, hostname, stack) is exactly what
+  // you need to diagnose a real production failure.
+  const lines: string[] = [];
+  let current: unknown = err;
+  let depth = 0;
+  while (current && depth < 5) {
+    if (current instanceof Error) {
+      const node = current as NodeJS.ErrnoException;
+      const fields = [
+        node.code ? `code=${node.code}` : null,
+        (node as unknown as { syscall?: string }).syscall ? `syscall=${(node as unknown as { syscall?: string }).syscall}` : null,
+        (node as unknown as { hostname?: string }).hostname ? `hostname=${(node as unknown as { hostname?: string }).hostname}` : null,
+        (node as unknown as { address?: string }).address ? `address=${(node as unknown as { address?: string }).address}` : null,
+        (node as unknown as { port?: number }).port ? `port=${(node as unknown as { port?: number }).port}` : null,
+      ].filter(Boolean).join(' ');
+      const label = depth === 0 ? 'cli error' : `caused by (${depth})`;
+      lines.push(`${label}: ${node.message}${fields ? ` [${fields}]` : ''}`);
+      if (node.stack) lines.push(node.stack);
+      current = (node as { cause?: unknown }).cause;
+    } else {
+      lines.push(`caused by (${depth}): ${String(current)}`);
+      current = null;
+    }
+    depth++;
+  }
+  log.error(lines.join('\n'));
   process.exitCode = 1;
 });

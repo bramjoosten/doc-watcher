@@ -139,7 +139,34 @@ export class ConfluenceClient {
       if (now < this.throttledUntilMs) {
         await new Promise<void>((r) => setTimeout(r, this.throttledUntilMs - now));
       }
-      const res = await fetch(url, init);
+      let res: Response;
+      try {
+        res = await fetch(url, init);
+      } catch (err) {
+        // undici wraps DNS / TCP / TLS failures as `TypeError: fetch failed`
+        // and stashes the real error on `.cause`. Surface enough of it to
+        // distinguish a typo in base_url (ENOTFOUND) from a firewall block
+        // (ECONNREFUSED) from a TLS chain problem (CERT_*). This violates
+        // the "one-line, no duplicated data" log convention deliberately —
+        // for errors the structured detail is the whole point.
+        const cause = (err as { cause?: unknown }).cause;
+        const causeErr = cause instanceof Error ? cause : null;
+        const causeBag = (cause ?? {}) as Record<string, unknown>;
+        const fields = [
+          causeErr ? `code=${(causeErr as NodeJS.ErrnoException).code ?? causeErr.name}` : null,
+          typeof causeBag.syscall === 'string' ? `syscall=${causeBag.syscall}` : null,
+          typeof causeBag.hostname === 'string' ? `hostname=${causeBag.hostname}` : null,
+          typeof causeBag.address === 'string' ? `address=${causeBag.address}` : null,
+          typeof causeBag.port === 'number' ? `port=${causeBag.port}` : null,
+        ].filter(Boolean).join(' ');
+        const msg = err instanceof Error ? err.message : String(err);
+        const causeMsg = causeErr ? causeErr.message : '';
+        log.error(
+          `fetch failed for ${url} on attempt ${attempt + 1}: ${msg}${fields ? ` [${fields}]` : ''}${causeMsg ? ` — cause: ${causeMsg}` : ''}`,
+        );
+        if (causeErr?.stack) log.error(`fetch failure stack:\n${causeErr.stack}`);
+        throw err;
+      }
       if (res.status !== 429 && res.status !== 503) {
         // Confluence sends X-RateLimit-* headers on EVERY authenticated
         // response. Snag them so the limiter can throttle proactively before
