@@ -29,6 +29,10 @@ export interface DownloadOptions {
   // The id is the page that was just written; callers can append it to a
   // jsonl rather than re-serialising the full state every time.
   flushState?: (id: string) => Promise<void>;
+  // Emit one log line per page indicating whether it was created or modified
+  // (and by whom). Suppressed on first run / --reset to avoid spamming the
+  // log with thousands of lines when every page looks new.
+  logPerPage: boolean;
 }
 
 export interface DownloadResult {
@@ -243,8 +247,16 @@ export async function downloadPages(pages: ConfluencePage[], opts: DownloadOptio
       limiter.wrap(async () => {
         try {
           const detailed = page.body?.storage ? page : await opts.client.getPage(page.id);
+          // Capture before state-mutate so we know if this was a creation or
+          // a modification — used by the per-page change log below.
+          const previouslyKnown = !!opts.state.pages[detailed.id];
           const result = await fetchAndWriteOne(detailed, opts, limiter, syncIso);
           written.push(result.relPath);
+          if (opts.logPerPage) {
+            const verb = previouslyKnown ? 'modified' : 'created';
+            const author = detailed.version?.by?.displayName ?? 'unknown';
+            log.info(`[${verb}] "${detailed.title}" (${detailed.id}) by ${author}`);
+          }
           // Update state in place.
           const detailedSpace = detailed.space?.key ?? 'UNKNOWN';
           opts.state.pages[detailed.id] = {

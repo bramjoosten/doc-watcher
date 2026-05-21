@@ -189,6 +189,11 @@ async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<v
     root.state.total_pages_downloaded = Object.keys(root.state.pages).length;
     log.info(`${root.title}: ${seen.size} page(s) in enumeration; ${remaining.length} need fetching (${newPageIds.size} new, ${updatedPageIds.size} updated)`);
 
+    // Per-page change logging is useful for incremental runs (you see
+    // exactly what got picked up), noisy on a first run / --reset where
+    // every page in the corpus would emit a line. `last_sync` is non-null
+    // iff a successful sync has already happened, so it's the natural gate.
+    const logPerPage = !!root.state.last_sync && !opts.reset;
     const result = await downloadPages(
       remaining,
       {
@@ -201,6 +206,7 @@ async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<v
         titleIndex,
         rootPageIds,
         limiter: adaptiveLimiter,
+        logPerPage,
         // Cheap per-page persistence: append one line to the sibling .jsonl
         // instead of re-serialising the whole .json. The .json is rewritten
         // (and the .jsonl deleted) at finalizeIndex below.
@@ -234,7 +240,10 @@ async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<v
           // this sync, the whole branch collapses cleanly instead of leaving
           // a chain of empty directories.
           await pruneEmptyParents(mdAbs, outputDir);
-          log.info(`removed deleted/archived page: ${st.title} (${id}) at ${st.path}`);
+          if (logPerPage) {
+            const author = st.last_modified_by ?? 'unknown';
+            log.info(`[deleted] "${st.title}" (${id}) — last edited by ${author}`);
+          }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           log.warn(`orphan delete failed for ${id} (root ${root.rootId}): ${msg}`);
