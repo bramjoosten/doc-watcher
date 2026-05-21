@@ -78,7 +78,7 @@ doc-watcher/
     └── log.ts
 ```
 
-### Output layout (`docs/` mirrors Confluence)
+### Output layout (`output_dir` mirrors Confluence — defaults to `../docs`, a sibling of the repo)
 
 ```
 docs/
@@ -155,7 +155,7 @@ Setup is manual: copy `config.example.ts` → `config.ts` and fill in the placeh
 
 ### Concurrency: adaptive limiter informed by server headers
 
-`parallel_downloads` in `config.ts` is an *upper ceiling*, not a target. For the body-download phase the adaptive limiter starts at concurrency = 1 (slow-start), doubles every 50 sustained successes up to the ceiling, and halves immediately on every 429-wave. `Retry-After` becomes a minimum inter-request spacing for the next window. The `--walkdb` subtree walk (`/child/page` paging) calls `limiter.warmUp(maxCapacity)` first — those calls are cheap metadata lookups, not real load, and a wide BFS level otherwise drags through one connection during slow-start. The 429 halving and budget-aware throttling stay in force after the warm-up, so the safety net is intact.
+The limiter's upper ceiling is a hardcoded `MAX_PARALLEL_DOWNLOADS = 20` in `taskmanager.ts` — not configurable, because in practice nobody ever needs to tune it. The adaptive logic does all the work: for the body-download phase the limiter starts at concurrency = 1 (slow-start), doubles every 50 sustained successes up to the ceiling, and halves immediately on every 429-wave. `Retry-After` becomes a minimum inter-request spacing for the next window. The `--walkdb` subtree walk (`/child/page` paging) calls `limiter.warmUp(maxCapacity)` first — those calls are cheap metadata lookups, not real load, and a wide BFS level otherwise drags through one connection during slow-start. The 429 halving and budget-aware throttling stay in force after the warm-up, so the safety net is intact.
 
 On top of that reactive AIMD, the client reads Confluence DC's `X-RateLimit-*` headers (`Limit`, `Remaining`, `Interval-Seconds`, `FillRate`) on *every* authenticated response and feeds them to the limiter. When `remaining/limit` drops below 20%, the limiter paces new requests at the sustainable refill rate (`intervalSeconds / fillRate`); below 5%, it pauses long enough for at least one token to refill. Goal: avoid hitting 429 in the first place rather than reacting after the fact. The first observed budget is also logged so you see what your server actually allows (e.g. *"50-token bucket, fills at 10/60s = 0.17 req/s sustainable"*).
 

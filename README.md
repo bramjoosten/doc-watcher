@@ -26,7 +26,7 @@ Edit `config.ts`:
 npm start
 ```
 
-Incremental sync — the first invocation downloads everything, every later run enumerates the subtree via CQL and only fetches pages whose version changed. Resumable on Ctrl+C: just run again to pick up where you stopped. Concurrency self-tunes from Confluence's `X-RateLimit-*` headers, so there's nothing to manually configure beyond the optional `parallel_downloads` ceiling.
+Incremental sync — the first invocation downloads everything, every later run enumerates the subtree via CQL and only fetches pages whose version changed. Resumable on Ctrl+C: just run again to pick up where you stopped. Concurrency self-tunes from Confluence's `X-RateLimit-*` headers — there's no knob to turn.
 
 **New pages take ~1 hour to show up.** CQL goes through Confluence's Lucene index, which lags page creation (existing-page edits are reflected instantly, since they trigger a per-page reindex). Two ways out: re-run later, or bypass the index entirely with the DB walk:
 

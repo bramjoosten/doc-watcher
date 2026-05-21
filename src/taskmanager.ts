@@ -33,10 +33,13 @@ import {
   writeTree,
 } from './state.ts';
 
-// Default cap when the user hasn't set parallel_downloads in config.yaml.
-// The adaptive limiter starts at 1 anyway and ramps based on observed
-// X-RateLimit-* headers, so this is just an upper ceiling, not a target.
-const DEFAULT_PARALLEL_DOWNLOADS = 20;
+// Upper ceiling on parallel page fetches. The adaptive limiter starts at 1
+// (slow-start), doubles every 50 successes up to this cap, halves on every
+// 429, honours Retry-After, and paces from Confluence's X-RateLimit-* headers
+// when the bucket gets low. So this is just the "no higher than" guard rail
+// — the limiter does the rest, and 20 is comfortable for any single-user
+// PAT. Not configurable: in practice nobody ever needed to tune it.
+const MAX_PARALLEL_DOWNLOADS = 20;
 
 // One root being synced. Each root has its own index file on disk.
 interface RootContext {
@@ -94,13 +97,8 @@ async function runSync(opts: { full: boolean; walkDb: boolean }): Promise<void> 
     );
   }
 
-  // Cap from config (or a flat default). Adaptive limiter starts at 1
-  // (slow-start), doubles every 50 successes up to this cap, halves on every
-  // 429, honours Retry-After, and paces from X-RateLimit-* headers when the
-  // server's budget gets low.
-  const parallelCap = config.parallel_downloads ?? DEFAULT_PARALLEL_DOWNLOADS;
-  const adaptiveLimiter = new AdaptiveLimiter({ max: parallelCap, slowStart: true });
-  log.info(`adaptive concurrency: starting at ${adaptiveLimiter.currentCapacity}, ramping toward ${parallelCap} on sustained success`);
+  const adaptiveLimiter = new AdaptiveLimiter({ max: MAX_PARALLEL_DOWNLOADS, slowStart: true });
+  log.info(`adaptive concurrency: starting at ${adaptiveLimiter.currentCapacity}, ramping toward ${MAX_PARALLEL_DOWNLOADS} on sustained success`);
 
   const client = new ConfluenceClient({
     baseUrl: config.base_url,
@@ -294,7 +292,7 @@ async function runSync(opts: { full: boolean; walkDb: boolean }): Promise<void> 
   }
 
   // Throttle stats — "of N HTTP requests, M had to back off." Useful to gauge
-  // whether parallel_downloads is set too high for the server.
+  // whether the limiter ceiling is set too high for the server.
   const total = client.totalRequests;
   const recovered = client.requestsRecoveredAfterBackoff;
   const failedAfterRetries = client.requestsFailedAfterRetries;

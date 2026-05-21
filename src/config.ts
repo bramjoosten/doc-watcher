@@ -18,10 +18,6 @@ export const configSchema = z.object({
   base_url: z.string().url(),
   pat: z.string().min(1, 'pat is required — paste your Confluence PAT'),
   output_dir: z.string().default('./docs').transform(expandTilde),
-  // Upper ceiling on parallel page fetches. The adaptive limiter starts at 1
-  // and ramps up to this value based on observed server budget; lowering it
-  // is a hard cap, raising it lets the limiter ramp higher.
-  parallel_downloads: z.number().int().positive().optional(),
   include_attachments: z.boolean().default(false),
   root_page_ids: z
     .union([z.string().min(1), z.array(z.string().min(1)).min(1)])

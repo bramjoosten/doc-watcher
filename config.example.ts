@@ -6,12 +6,6 @@ import type { ConfigInput } from './src/config.ts';
 // editor and turns typos into compile-time errors.
 
 export default {
-  // Upper ceiling on parallel page fetches. The adaptive limiter starts at 1
-  // and ramps up to this value based on what Confluence's X-RateLimit-* headers
-  // say is safe. Lower this to enforce a hard cap; raise it to let the limiter
-  // ramp higher. Default (when omitted) is 20.
-  parallel_downloads: 20,
-
   // Root URL of your Confluence install (no trailing slash, no /rest/api).
   base_url: 'https://confluence.example.com',
 
@@ -24,8 +18,11 @@ export default {
   // the per-root index files (`index-<title>--<id>.json`) live inside this
   // directory, so moving or backing up the folder carries everything with
   // it. Accepts an absolute path, `~`-prefixed home-relative path, or a path
-  // relative to the project working directory.
-  output_dir: './docs',
+  // relative to the project working directory. Default puts it as a sibling
+  // of the doc-watcher repo so you can open the mirrored corpus in a
+  // separate IDE window (or just `cd ../docs` and ripgrep it) without the
+  // doc-watcher source getting in the way.
+  output_dir: '../docs',
 
   // Inline images referenced via ac:image macros. Set to true once you've
   // gauged bandwidth on a small first sync — a space with diagrams can
