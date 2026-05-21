@@ -1,6 +1,6 @@
 # doc-watcher
 
-A local watcher script that mirrors a Confluence Server (on-prem) tree to disk so it can be searched and queried by IDE's and local AI. Authenticates with a user-level Personal Access Token, downloads fast (in parallel with concurrency, and re-runs incrementally — only fetching pages whose `lastmodified` is newer than the last sync.
+A local watcher script that mirrors a Confluence Server (on-prem) tree to disk so it can be searched and queried by IDE's and local AI. Authenticates with a user-level Personal Access Token, downloads in parallel with adaptive concurrency, and re-runs incrementally — every run re-enumerates the full subtree metadata, but only pages whose `version` has changed actually get re-fetched.
 
 Node.js, TypeScript, run via `tsx`.
 
@@ -9,7 +9,7 @@ Node.js, TypeScript, run via `tsx`.
 ### Must-have
 
 - **Fast (parallel downloads).** A space can hold thousands of pages. The fetcher runs requests in parallel with bounded concurrency — enough to keep the network pipe full, not enough to get rate-limited.
-- **Keep in sync.** Cheap re-runs that only fetch what changed since the last sync (using each page's `lastmodified` timestamp, queried via CQL). Removes pages that have been deleted or moved out of scope. Two runs back-to-back should produce identical output.
+- **Keep in sync.** Cheap re-runs: every run paginates the full subtree's page list (metadata only, no bodies) and diffs each page's `version` against the local state to decide what to actually re-fetch. Removes pages that have been deleted or moved out of scope. Two runs back-to-back should produce identical output.
 - **Node.js only (no Python).** Many organisations keep their stack narrow. Ruling out Python up front means doc-watcher drops into any Node-based environment without adding a runtime.
 - **Keep the source HTML alongside the markdown.** For each page we save both `<file>.html` (the raw Confluence storage-format response) and `<file>.md` (the readable conversion). The HTML is the durable source of truth; the markdown is a regeneratable view. Conversion runs through a deterministic script (cheerio + an in-house HTML→Markdown walker + a macro registry), never an LLM, so re-running the converter on the saved HTML always produces the same markdown. If a future converter improvement lands, the corpus can be re-derived without re-hitting Confluence.
 
@@ -37,7 +37,7 @@ State lives in **per-root index files** at `<output_dir>/index-<slug>--<root_id>
 
 The index is the **source of truth** for all structural metadata: Confluence ID, version, ancestors, last-modified, links, embeds, webui URL. The `.md` files carry a small **regeneratable** YAML frontmatter view of the same data, so a single `.md` is self-describing without consulting the index — but the index always wins. Frontmatter fields are: `title`, `version`, `last_modified`, `last_modified_by`, `webui_url`. The frontmatter is rewritten by `reconvert` from index data on every run; nothing depends on the body of the frontmatter being canonical, so it can drift mid-run without consequence (the next sync or reconvert overwrites it).
 
-The top of each index opens with a self-describing `description` string so anyone opening the file knows what it is and how it's maintained — regenerated on every full write, not state. Followed by identification and counters — `root_page_id`, `root_title`, `total_watched_pages_on_remote` (what Confluence reported in the last sync's CQL window), `total_pages_downloaded` (current size of the `pages` map), and the `last_sync` / `last_full_enumeration` timestamps. Counters are updated incrementally as each page is written, so an interrupted run leaves them in sync with what's actually on disk. The bulk `pages` map sits below.
+The top of each index opens with a self-describing `description` string so anyone opening the file knows what it is and how it's maintained — regenerated on every full write, not state. Followed by identification and counters — `root_page_id`, `root_title`, `total_watched_pages_on_remote` (what Confluence reported in the last sync), `total_pages_downloaded` (current size of the `pages` map), and the `last_sync` timestamp. Counters are updated incrementally as each page is written, so an interrupted run leaves them in sync with what's actually on disk. The bulk `pages` map sits below.
 
 Filename uses `--<root_id>` as the durable anchor — a root-title change just renames the file but leaves the index discoverable by id. Discovery is by glob (`index-*--<root_id>.json`); whoever owns the index wins.
 
@@ -107,12 +107,14 @@ docs/
 Confluence Server has no dedicated sync endpoint, but CQL on `/rest/api/content/search` is enough:
 
 ```
-(space = "ENG" OR ancestor = 12345) AND type = page AND lastmodified >= "<last_sync_iso>"
+(id = 12345 OR ancestor = 12345) AND type = page
 ```
 
-For a 10k-page space the typical delta per 5-minute window is 0–50 pages — sub-second API time. `last_sync` in the state file is the lower bound; first run has none and does a full enumeration. Every subsequent run is delta-only.
+Every run enumerates the full subtree of each configured root via this single CQL, with `expand=version,space,ancestors` (no body) — cheap, ~1 request per 100 pages. The per-page `version` returned by Confluence is then diffed against the index: pages with a higher version (or no entry in state) get fetched with `expand=body.storage`; everything else is skipped. New pages, edits, renames, re-parents and deletes all fall out of this single mechanism.
 
-**Deletes** aren't visible in the incremental query (they're just absent). The default `sync` runs a cheap id-only full enumeration once per day to reconcile orphans (gated by per-root `last_full_enumeration`). `refresh` always does a full enumeration. Pages that have been **deleted or archived** in Confluence disappear from CQL results, fall into the orphan set on the next full enumeration, and both their `.html` and `.md` are removed from disk; the state entry is dropped too.
+**Why not narrow by `lastmodified`?** An earlier design appended `AND lastmodified >= "<last_sync>"` to keep the result set tiny on incremental runs. We dropped it: in practice the field doesn't reliably reflect page creation on Confluence Server (newly created pages were silently missed on every incremental run until a daily full enumeration caught them, then they showed up with no body if the user hadn't run `refresh`). Always-full enumeration trades a small amount of metadata pagination for correctness — and the per-page version diff still keeps actual downloads minimal.
+
+**Deletes.** A page that's been deleted or archived in Confluence disappears from the full enumeration. Anything in the local index but not in the latest enumeration falls into the orphan set; both its `.html` and `.md` are removed from disk and the state entry is dropped.
 
 ### Confluence REST endpoints used
 
@@ -137,7 +139,7 @@ Always deterministic, always replayable. The `.html` file on disk is what the co
 
 Verbs:
 
-- **`sync`** (default): build CQL with `lastmodified` lower bound, page through results, diff against state, fetch changed pages in parallel, write both `.html` and `.md`, atomic state-file replace at the end.
+- **`sync`** (default): enumerate the full subtree via CQL (`expand=version,space,ancestors`, no body), diff each page's version against state, fetch any new-or-changed pages in parallel, write both `.html` and `.md`, atomic state-file replace at the end.
 - **`refresh`**: same as `sync` but ignores `last_sync` (full re-download).
 - **`reconvert`**: walk every `.html` already on disk and regenerate the `.md` next to it. No network calls. Used after a converter change.
 

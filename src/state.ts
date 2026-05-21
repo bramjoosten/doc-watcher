@@ -21,7 +21,6 @@ export interface StateFile {
   root_page_id: string;
   root_title: string;
   last_sync: string | null;
-  last_full_enumeration: string | null;
   pages: Record<string, PageState>;
 }
 
@@ -32,7 +31,6 @@ export function emptyState(rootId: string, rootTitle: string): StateFile {
     root_page_id: rootId,
     root_title: rootTitle,
     last_sync: null,
-    last_full_enumeration: null,
     pages: {},
   };
 }
@@ -73,7 +71,6 @@ export async function readIndex(filePath: string, rootId: string, rootTitle: str
       root_page_id: parsed.root_page_id ?? rootId,
       root_title: parsed.root_title ?? rootTitle,
       last_sync: parsed.last_sync ?? null,
-      last_full_enumeration: parsed.last_full_enumeration ?? null,
       pages: parsed.pages ?? {},
     };
   } catch (err) {

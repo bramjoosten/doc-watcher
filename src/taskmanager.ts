@@ -33,8 +33,6 @@ import {
 } from './state.js';
 import { buildCQL } from './walker.js';
 
-const FULL_ENUMERATION_INTERVAL_MS = 24 * 60 * 60 * 1000;
-
 // Default cap when the user hasn't set parallel_downloads in config.yaml.
 // The adaptive limiter starts at 1 anyway and ramps based on observed
 // X-RateLimit-* headers, so this is just an upper ceiling, not a target.
@@ -81,7 +79,7 @@ async function resolveRoot(
   };
 }
 
-async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }): Promise<void> {
+async function runSync(opts: { full: boolean }): Promise<void> {
   const { config, rootDir } = await loadConfig();
   const outputDir = resolve(rootDir, config.output_dir);
   await mkdir(outputDir, { recursive: true });
@@ -161,8 +159,7 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
   const allErrorSummary: Record<string, number> = {};
 
   for (const root of roots) {
-    const since = opts.full ? undefined : root.state.last_sync ?? undefined;
-    const cql = buildCQL(root.rootId, since);
+    const cql = buildCQL(root.rootId);
     log.info({ rootId: root.rootId, title: root.title, cql }, `syncing root "${root.title}" (${root.rootId})`);
 
     const results = await client.searchByCQL(cql, ['version', 'space', 'ancestors']);
@@ -213,44 +210,25 @@ async function runSync(opts: { full: boolean; forceFullEnumeration?: boolean }):
       syncIso,
     );
 
-    // Delete reconciliation (per root)
-    const lastFull = root.state.last_full_enumeration ? Date.parse(root.state.last_full_enumeration) : NaN;
-    const daily = Number.isNaN(lastFull) || Date.now() - lastFull > FULL_ENUMERATION_INTERVAL_MS;
-    const doFullEnumeration = opts.full || since === undefined || opts.forceFullEnumeration === true || daily;
-
-    let deletedCount = 0;
-    if (doFullEnumeration) {
-      let allIds: Set<string>;
-      if (opts.full || since === undefined) {
-        allIds = new Set(seen.keys());
-      } else {
-        const fullSeen = new Set<string>();
-        const fullCql = buildCQL(root.rootId);
-        const fullResults = await client.searchByCQL(fullCql, ['version']);
-        for (const r of fullResults) fullSeen.add(r.id);
-        allIds = fullSeen;
-        log.info({ rootId: root.rootId, count: allIds.size }, `${root.title}: daily full page-list refresh done (${allIds.size} on remote)`);
+    // Delete reconciliation. Every sync enumerates the full subtree (we no
+    // longer narrow by lastmodified), so anything in state but not in `seen`
+    // has been deleted, archived, or moved out of scope on Confluence.
+    const allIds = new Set(seen.keys());
+    const toDelete = Object.keys(root.state.pages).filter((id) => !allIds.has(id));
+    const deletedCount = toDelete.length;
+    for (const id of toDelete) {
+      const st = root.state.pages[id];
+      if (!st) continue;
+      const mdAbs = resolve(outputDir, st.path);
+      const htmlAbs = htmlPathFor(mdAbs);
+      try {
+        await rm(mdAbs, { force: true });
+        await rm(htmlAbs, { force: true });
+        log.info({ rootId: root.rootId, id, path: st.path, title: st.title }, `removed deleted/archived page: ${st.title} (${id})`);
+      } catch (err) {
+        log.warn({ rootId: root.rootId, err, id }, 'orphan delete failed');
       }
-      const toDelete = Object.keys(root.state.pages).filter((id) => !allIds.has(id));
-      deletedCount = toDelete.length;
-      for (const id of toDelete) {
-        const st = root.state.pages[id];
-        if (!st) continue;
-        // Remove both .md and the .html companion. A page deleted or archived
-        // in Confluence no longer appears in CQL results, so it falls into
-        // toDelete here — both on-disk files go.
-        const mdAbs = resolve(outputDir, st.path);
-        const htmlAbs = htmlPathFor(mdAbs);
-        try {
-          await rm(mdAbs, { force: true });
-          await rm(htmlAbs, { force: true });
-          log.info({ rootId: root.rootId, id, path: st.path, title: st.title }, `removed deleted/archived page: ${st.title} (${id})`);
-        } catch (err) {
-          log.warn({ rootId: root.rootId, err, id }, 'orphan delete failed');
-        }
-        delete root.state.pages[id];
-      }
-      root.state.last_full_enumeration = syncIso;
+      delete root.state.pages[id];
     }
 
     if (result.errors.length === 0) {
@@ -427,18 +405,16 @@ async function runReconvert(): Promise<void> {
 
 
 function usage(): void {
-  console.error('usage: npm start -- <sync|refresh|reconvert> [--force-full-enumeration]');
-  console.error('default (no args): sync  (incremental — does the initial download on first run)');
-  console.error('autotune runs automatically when parallel_downloads is unset in config.yaml.');
+  console.error('usage: npm start -- <sync|refresh|reconvert>');
+  console.error('default (no args): sync — enumerate the full subtree, fetch only pages whose version changed.');
 }
 
-const [, , cmd, ...rest] = process.argv;
-const forceFullEnumeration = rest.includes('--force-full-enumeration');
+const [, , cmd] = process.argv;
 
 (async () => {
   switch (cmd ?? 'sync') {
     case 'sync':
-      await runSync({ full: false, forceFullEnumeration });
+      await runSync({ full: false });
       break;
     case 'refresh':
       await runSync({ full: true });
