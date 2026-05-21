@@ -1,16 +1,20 @@
 import type { WatchEntry } from './config.js';
 
 // Format a JS ISO timestamp into the shape Confluence Server CQL reliably
-// accepts: "yyyy-MM-dd HH:mm" — no T, no seconds, no ms, no Z. Server CQL
-// interprets the value in the server's local timezone, so we back-shift by
-// 60 s to absorb clock-skew + small TZ ambiguity. Worst case we re-fetch a
-// minute's worth of unchanged pages; never missed updates.
+// accepts: "yyyy-MM-dd HH:mm" — no T, no seconds, no ms, no Z. CQL has no
+// way to specify a timezone in the literal; the server interprets it in
+// its own configured local timezone. We format using the *client's*
+// local timezone (`getHours()` not `getUTCHours()`) on the assumption
+// that a single-tenant on-prem Confluence runs in the same timezone as
+// the people using it. If client and server are in the same TZ, this
+// matches the user's wall-clock expectations exactly. A small 60 s
+// back-shift absorbs clock skew.
 function formatCQLDate(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
   const shifted = new Date(d.getTime() - 60_000);
   const pad = (n: number) => String(n).padStart(2, '0');
-  return `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())} ${pad(shifted.getUTCHours())}:${pad(shifted.getUTCMinutes())}`;
+  return `${shifted.getFullYear()}-${pad(shifted.getMonth() + 1)}-${pad(shifted.getDate())} ${pad(shifted.getHours())}:${pad(shifted.getMinutes())}`;
 }
 
 function quoteCQLDate(iso: string): string {
