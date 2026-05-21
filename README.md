@@ -26,12 +26,12 @@ Edit `config.ts`:
 npm start
 ```
 
-Incremental sync — the first invocation downloads everything, every later run enumerates the subtree via CQL and only fetches pages whose version changed. Resumable on Ctrl+C: just run again to pick up where you stopped. Concurrency self-tunes from Confluence's `X-RateLimit-*` headers — there's no knob to turn.
+Incremental sync. The first invocation paginates the whole subtree via CQL and downloads everything. Every later run uses a `lastmodified >= last_sync` filter, so it's typically one request that returns only the pages edited since last run — sub-second on a normal day. Resumable on Ctrl+C: just run again to pick up where you stopped. Concurrency self-tunes from Confluence's `X-RateLimit-*` headers — there's no knob to turn.
 
-**New pages take ~1 hour to show up.** CQL goes through Confluence's Lucene index, which lags page creation (existing-page edits are reflected instantly, since they trigger a per-page reindex). Two ways out: re-run later, or bypass the index entirely with the DB walk:
+**New and deleted pages need an opt-in mode.** CQL goes through Confluence's Lucene index, which lags page creation by ~1 hour (existing-page edits are reflected instantly, since they trigger a synchronous per-page reindex), and a filtered CQL result can't tell "unchanged" from "deleted." Either re-run later, or pick them up immediately with a DB walk:
 
 ```sh
-npm start -- --walkdb     # recursive /child/page walk — slower, but sees new pages immediately
+npm start -- --includeNew  # recursive /child/page walk — slower, but sees new and deleted pages
 ```
 
 ## What it doesn't mirror
@@ -40,8 +40,8 @@ npm start -- --walkdb     # recursive /child/page walk — slower, but sees new 
 
 ## Other verbs
 
-- `npm start -- refresh` — full re-download (ignores `last_sync`, reconciles deletes). Accepts `--walkdb`.
-- `npm start -- reconvert` — regenerate every `.md` from the saved `.html` (no network)
+- `npm start -- --reset` — wipe in-memory state so every page is treated as new; re-downloads everything in one pass. Composable with `--includeNew`.
+- `npm start -- reconvert` — regenerate every `.md` from the saved `.html` (no network).
 
 ## Risk profile
 

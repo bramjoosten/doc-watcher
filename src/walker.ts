@@ -93,26 +93,50 @@ export async function enumerateSubtree(
   return { pages, pagesWithChildren };
 }
 
-// Fast path: one paginated CQL call per root, returning the whole subtree
-// plus the version/ancestors/space metadata in one shot. Routes through
-// Lucene, so brand-new pages may be invisible for ~an hour until the
-// background indexer catches them — see Atlassian's content-index-
-// administration KB. Default for `sync` because edits to existing pages
-// fire the per-page reindex synchronously and so are reflected instantly.
-// Callers needing immediate visibility of new pages should use the DB
-// walk (`enumerateSubtree`) instead.
+// Fast path: one paginated CQL call per root. Returns only pages whose
+// `lastmodified` is at or after the cutoff when `sinceIso` is provided —
+// edits to existing pages fire Confluence's synchronous per-page reindex
+// so they're caught instantly. With `sinceIso` undefined (first run, or
+// after `--reset` wiped state) it falls back to a full subtree
+// enumeration — same Lucene query without the time filter.
+//
+// What this path *doesn't* see: brand-new pages (Lucene hasn't indexed
+// them yet — Atlassian's content-index-administration KB puts that on
+// the order of an hour) and deletions (they just stop appearing in CQL
+// results; you need a full enumeration to spot the absences). Callers
+// who need either run `enumerateSubtree` (DB walk) instead.
 export async function enumerateViaCQL(
   rootId: string,
   client: ConfluenceClient,
+  sinceIso: string | null,
 ): Promise<SubtreeEnumeration> {
-  const cql = `(id = ${rootId} OR ancestor = ${rootId}) AND type = page`;
+  const baseCql = `(id = ${rootId} OR ancestor = ${rootId}) AND type = page`;
+  const cql = sinceIso
+    ? `${baseCql} AND lastmodified >= ${quoteCQLDate(sinceIso)}`
+    : baseCql;
   const pages = await client.searchByCQL(cql, ['version', 'space', 'ancestors']);
   // pagesWithChildren = the union of every page's ancestor-ids. Anything
   // that shows up as someone else's ancestor must itself have at least
-  // one child.
+  // one child. With the lastmodified filter we only see *changed* pages,
+  // so this set covers parents-of-changed-pages — sufficient for the
+  // path-resolution work the downloader does on them. Unchanged pages
+  // keep using their cached path from state.
   const pagesWithChildren = new Set<string>();
   for (const page of pages) {
     for (const a of page.ancestors ?? []) pagesWithChildren.add(a.id);
   }
   return { pages, pagesWithChildren };
+}
+
+// CQL date literal: "yyyy-MM-dd HH:mm" with no timezone (Confluence
+// interprets the wall-clock value in the server's configured TZ). We
+// assume server TZ matches the client's — fine for a single-tenant
+// on-prem deployment — and back-shift by 60 s to absorb clock skew.
+function quoteCQLDate(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return `"${iso}"`;
+  const shifted = new Date(d.getTime() - 60_000);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const formatted = `${shifted.getFullYear()}-${pad(shifted.getMonth() + 1)}-${pad(shifted.getDate())} ${pad(shifted.getHours())}:${pad(shifted.getMinutes())}`;
+  return `"${formatted}"`;
 }

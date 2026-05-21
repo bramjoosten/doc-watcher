@@ -66,7 +66,7 @@ doc-watcher/
 ├── config.ts                       # gitignored — TS module with base_url, pat, root_page_ids, etc.
 ├── .gitignore                      # ignores config.ts, docs/, .claude/, node_modules/
 └── src/
-    ├── taskmanager.ts              # entry point: sync / refresh / reconvert
+    ├── taskmanager.ts              # entry point: sync / reconvert; --includeNew / --reset flags
     ├── config.ts                   # zod schema, YAML loader
     ├── confluence.ts               # REST client (typed wrappers around fetch)
     ├── walker.ts                   # subtree enumeration: CQL fast path + /child/page DB walk
@@ -104,29 +104,31 @@ docs/
 
 ### Change detection
 
-Confluence Server has no dedicated sync endpoint. We have two enumeration strategies, with the choice driven by the `--walkdb` flag:
+Confluence Server has no dedicated sync endpoint, and the three types of change we care about (modification, creation, deletion) each have a different cost/freshness profile. So we offer two enumeration modes:
 
-**Default (CQL/Lucene).** One paginated call per root, `expand=version,space,ancestors`:
+**Default `sync` — CQL incremental.** One paginated call per root. When `state.last_sync` exists, the query carries a `lastmodified >=` filter, so the result is "just the pages edited since last run" — typically 1 request. On first run (or after `--reset` wiped state) the filter is omitted and CQL paginates the whole subtree.
 
 ```
-GET /rest/api/content/search?cql=(id = N OR ancestor = N) AND type = page&expand=version,space,ancestors
+GET /rest/api/content/search?cql=(id = N OR ancestor = N) AND type = page AND lastmodified >= "yyyy-MM-dd HH:mm"&expand=version,space,ancestors
 ```
 
-Fast (one paginated call covers ~100 pages per request) and good enough for the common case: an edit to an existing page triggers a synchronous per-page reindex, so the new version is visible to CQL immediately. The downside is new-page *creation*: those go through the background indexer, which on a real instance can lag the database by up to ~1 hour. Atlassian's content-index-administration KB documents this. The end of every CQL-mode run logs a hint: re-run after ~1h, or switch to `--walkdb`.
+Modifications fire `lastmodified` instantly (Confluence reindexes the edited page synchronously), so they're caught in the next sync. Creations and deletions are NOT picked up here: new pages don't appear in CQL until the background indexer catches up (~1h on real instances — see Atlassian's content-index-administration KB), and deletes just stop appearing in CQL results — a filtered result can't tell "didn't change" from "no longer exists." The end-of-run hint reminds the user to re-run later or switch to `--includeNew`.
 
-**`--walkdb` (DB walk, opt-in).** A recursive `/rest/api/content/{id}/child/page` walk: one call per parent page in the subtree, BFS, scheduled through the adaptive limiter as a streaming pool (no per-level barrier, so a slow parent doesn't freeze its level's siblings). The walker stitches each child's ancestor chain together locally (`child.ancestors = parent.ancestors + parent`) and inherits `space` from the root, so the per-page response only needs `expand=version`. Hits the content table directly — no Lucene involvement — so newly-created pages show up immediately. The cost: more API calls (~1 per parent page vs. ~1 per 100 pages on CQL), but the limiter warms straight to its ceiling for this phase (it's metadata-only, not the heavy body fetches slow-start was designed for) and 429 halving stays in force.
+**`--includeNew` — DB walk.** A recursive `/rest/api/content/{id}/child/page` walk: one call per parent page in the subtree, BFS, scheduled through the adaptive limiter as a streaming pool (no per-level barrier, so a slow parent doesn't freeze its level's siblings). The walker stitches each child's ancestor chain together locally (`child.ancestors = parent.ancestors + parent`) and inherits `space` from the root, so the per-page response only needs `expand=version`. Hits the content table directly — no Lucene involvement — so newly-created pages show up immediately AND we see the full subtree, which lets us reconcile deletes. The cost: more API calls (~1 per parent page vs. 1 per 100 pages on CQL), but the limiter warms straight to its ceiling for this phase and 429 halving stays in force.
 
-**Once enumerated, both paths feed the same downstream pipeline.** The per-page `version` returned by the API is diffed against the local index: pages with a higher version (or no entry in state) get fetched with `expand=body.storage`; everything else is skipped. New pages, edits, renames, re-parents and deletes all fall out of this single mechanism.
+**`--reset` flag.** Wipes the in-memory state for each root before sync, so everything looks "new" to the version diff and gets re-downloaded. Equivalent to a first run on top of existing on-disk files. Useful as a recovery mechanism if the index file gets corrupted or the user wants a guaranteed-clean fetch. Composable with `--includeNew` (`--reset --includeNew` rebuilds from scratch via the DB walk).
+
+**Once enumerated, both paths feed the same downstream pipeline.** The per-page `version` returned by the API is diffed against the local index: pages with a higher version (or no entry in state) get fetched with `expand=body.storage`; everything else is skipped.
+
+**Delete reconciliation runs only when we've seen the full subtree** — i.e. `--includeNew`, or the first-run / `--reset` CQL path. On a filtered incremental sync we'd be unable to distinguish "unchanged" from "deleted," so we skip reconciliation and wait for the next full sweep. The orphan-removal logic itself is unchanged: a page in state but not in the latest enumeration has its `.html` and `.md` `rm`'d, the state entry is dropped, and any parent folder that's been left empty is `rmdir`'d (walking up until we hit a non-empty directory or the output root).
 
 **Why not /descendant/page?** An interim attempt used `/rest/api/content/{id}/descendant/page` with `expand=version,space,ancestors` — also DB-backed, in a single paginated call. It 500'd on real subtrees: Confluence eagerly built the full ancestor chain for every result and the combined cost exceeded the endpoint's budget. The recursive `/child/page` walk synthesizes ancestors client-side and so never asks for the expensive expand.
 
-**Deletes.** A page that's been deleted or archived in Confluence stops appearing in the enumeration (whether CQL or DB walk). Anything in the local index but not in the latest enumeration falls into the orphan set; both its `.html` and `.md` are removed from disk, the state entry is dropped, and any parent folder that's been left empty is `rmdir`'d (walking up until we hit a non-empty directory or the output root). Caveat: a brand-new restriction can look like a delete in CQL mode if the page hasn't been reindexed yet.
-
 ### Confluence REST endpoints used
 
-- `GET /rest/api/content/search?cql=...&expand=version,space,ancestors&limit=100` — default subtree enumeration via CQL/Lucene. Paginated.
-- `GET /rest/api/content/{id}/child/page?expand=version&limit=100` — direct children of a page (DB-backed, bypasses Lucene). Called recursively through the subtree by the `--walkdb` path in `walker.ts`.
-- `GET /rest/api/content/{id}?expand=body.storage,version,ancestors,space` — full page (storage-format XHTML). Also used to fetch the root page itself in `--walkdb` mode.
+- `GET /rest/api/content/search?cql=...&expand=version,space,ancestors&limit=100` — default subtree enumeration via CQL/Lucene. Carries a `lastmodified >=` filter when `state.last_sync` is set. Paginated.
+- `GET /rest/api/content/{id}/child/page?expand=version&limit=100` — direct children of a page (DB-backed, bypasses Lucene). Called recursively through the subtree by the `--includeNew` path in `walker.ts`.
+- `GET /rest/api/content/{id}?expand=body.storage,version,ancestors,space` — full page (storage-format XHTML). Also used to fetch the root page itself in `--includeNew` mode.
 
 Auth: `Authorization: Bearer <pat from config.ts>` on every request.
 
@@ -144,15 +146,14 @@ Always deterministic, always replayable. The `.html` file on disk is what the co
 
 Verbs:
 
-- **`sync`** (default): enumerate the subtree via CQL (fast path, Lucene-backed). With `--walkdb`, enumerate via recursive `/child/page` walk instead (slower, but sees newly-created pages immediately). Either way: diff each page's version against state, fetch any new-or-changed pages in parallel with `expand=body.storage,version,ancestors,space`, write both `.html` and `.md`, atomic state-file replace at the end. CQL-mode runs print a hint at the bottom about re-running after ~1h or using `--walkdb` to bypass the index.
-- **`refresh`**: same as `sync` but ignores `last_sync` (full re-download).
+- **`sync`** (default): enumerate the subtree via CQL with the `lastmodified >=` filter (or no filter if no prior `last_sync`). With `--includeNew`, enumerate via the recursive `/child/page` DB walk instead (slower, but sees newly-created and deleted pages). With `--reset`, treat in-memory state as empty so every page in the enumeration looks new. Either way: diff each page's version against state, fetch any new-or-changed pages in parallel with `expand=body.storage,version,ancestors,space`, write both `.html` and `.md`, atomic state-file replace at the end. Incremental-mode runs print a hint at the bottom about `--includeNew` for new/deleted pages.
 - **`reconvert`**: walk every `.html` already on disk and regenerate the `.md` next to it. No network calls. Used after a converter change.
 
 Setup is manual: copy `config.example.ts` → `config.ts` and fill in the placeholders (`base_url`, `pat`, at least one `root_page_ids` entry). The shape is intentionally flat — every key sits at the top level of the default export. `root_page_ids` accepts either a single string or a list of strings; each is a Confluence page id whose subtree gets mirrored. The `satisfies ConfigInput` annotation at the bottom turns typos into compile-time errors.
 
 ### Concurrency: adaptive limiter informed by server headers
 
-The limiter's upper ceiling is a hardcoded `MAX_PARALLEL_DOWNLOADS = 20` in `taskmanager.ts` — not configurable, because in practice nobody ever needs to tune it. The adaptive logic does all the work: for the body-download phase the limiter starts at concurrency = 1 (slow-start), doubles every 50 sustained successes up to the ceiling, and halves immediately on every 429-wave. `Retry-After` becomes a minimum inter-request spacing for the next window. The `--walkdb` subtree walk (`/child/page` paging) calls `limiter.warmUp(maxCapacity)` first — those calls are cheap metadata lookups, not real load, and a wide BFS level otherwise drags through one connection during slow-start. The 429 halving and budget-aware throttling stay in force after the warm-up, so the safety net is intact.
+The limiter's upper ceiling is a hardcoded `MAX_PARALLEL_DOWNLOADS = 20` in `taskmanager.ts` — not configurable, because in practice nobody ever needs to tune it. The adaptive logic does all the work: for the body-download phase the limiter starts at concurrency = 1 (slow-start), doubles every 50 sustained successes up to the ceiling, and halves immediately on every 429-wave. `Retry-After` becomes a minimum inter-request spacing for the next window. The `--includeNew` subtree walk (`/child/page` paging) calls `limiter.warmUp(maxCapacity)` first — those calls are cheap metadata lookups, not real load, and a wide BFS level otherwise drags through one connection during slow-start. The 429 halving and budget-aware throttling stay in force after the warm-up, so the safety net is intact.
 
 On top of that reactive AIMD, the client reads Confluence DC's `X-RateLimit-*` headers (`Limit`, `Remaining`, `Interval-Seconds`, `FillRate`) on *every* authenticated response and feeds them to the limiter. When `remaining/limit` drops below 20%, the limiter paces new requests at the sustainable refill rate (`intervalSeconds / fillRate`); below 5%, it pauses long enough for at least one token to refill. Goal: avoid hitting 429 in the first place rather than reacting after the fact. The first observed budget is also logged so you see what your server actually allows (e.g. *"50-token bucket, fills at 10/60s = 0.17 req/s sustainable"*).
 

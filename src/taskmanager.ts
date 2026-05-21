@@ -56,7 +56,7 @@ async function resolveRoot(
   fresh: boolean,
 ): Promise<RootContext> {
   if (fresh) {
-    // refresh wipes per-root state — fetch a current title so the filename is fresh.
+    // --reset wipes per-root state — fetch a current title so the filename is fresh.
     const page = await client.getPage(rootId, ['version']);
     const title = page.title;
     return {
@@ -82,7 +82,7 @@ async function resolveRoot(
   };
 }
 
-async function runSync(opts: { full: boolean; walkDb: boolean }): Promise<void> {
+async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<void> {
   const { config, rootDir } = await loadConfig();
   const outputDir = resolve(rootDir, config.output_dir);
   await mkdir(outputDir, { recursive: true });
@@ -93,7 +93,7 @@ async function runSync(opts: { full: boolean; walkDb: boolean }): Promise<void> 
   const oldStatePath = resolve(outputDir, '.state.json');
   if (existsSync(oldStatePath)) {
     log.warn(
-      `found legacy .state.json at ${oldStatePath} from before per-root indexes — ignored. Run \`npm start -- refresh\` to rebuild as per-root index files, then delete .state.json.`,
+      `found legacy .state.json at ${oldStatePath} from before per-root indexes — ignored. Run \`npm start -- --reset\` to rebuild as per-root index files, then delete .state.json.`,
     );
   }
 
@@ -109,7 +109,7 @@ async function runSync(opts: { full: boolean; walkDb: boolean }): Promise<void> 
   // Load (or initialise) one index per configured root.
   const roots: RootContext[] = [];
   for (const rootId of config.root_page_ids) {
-    roots.push(await resolveRoot(outputDir, rootId, client, opts.full));
+    roots.push(await resolveRoot(outputDir, rootId, client, opts.reset));
   }
   const totalLocal = roots.reduce((acc, r) => acc + Object.keys(r.state.pages).length, 0);
   const rootSummary = roots
@@ -145,17 +145,24 @@ async function runSync(opts: { full: boolean; walkDb: boolean }): Promise<void> 
   const allErrorSummary: Record<string, number> = {};
 
   for (const root of roots) {
-    log.info(`syncing root "${root.title}" (${root.rootId}) via ${opts.walkDb ? 'DB walk (slow, immediate)' : 'CQL/Lucene (fast, ~1h lag on new pages)'}`);
+    const mode = opts.includeNew
+      ? 'DB walk (slow, catches edits + creations + deletions)'
+      : root.state.last_sync
+        ? `CQL incremental, lastmodified >= ${root.state.last_sync} (instant, edits only)`
+        : 'CQL full enumeration (first run / after --reset)';
+    log.info(`syncing root "${root.title}" (${root.rootId}) via ${mode}`);
 
-    // Two enumeration strategies. Default is CQL: one paginated call per root,
-    // routes through Lucene, so brand-new pages may be invisible for an hour
-    // (existing-page edits show up instantly because they trigger a per-page
-    // reindex). The `--walkdb` flag opts in to a recursive /child/page walk
-    // that hits the DB directly and sees new pages immediately, at the cost
-    // of more API calls.
-    const { pages: results, pagesWithChildren } = opts.walkDb
+    // Two enumeration strategies:
+    //   • Default (CQL): if state.last_sync is set, append a `lastmodified >=`
+    //     filter to the CQL — typically returns just the few pages edited
+    //     since last run, in one request. On first run / after --reset the
+    //     filter is omitted and we paginate the whole subtree.
+    //   • --includeNew: recursive /child/page walk via the DB-backed
+    //     endpoint. Slower but the only path that picks up brand-new pages
+    //     (Lucene lags creation by ~1h) and reconciles deletes.
+    const { pages: results, pagesWithChildren } = opts.includeNew
       ? await enumerateSubtree(root.rootId, client, adaptiveLimiter)
-      : await enumerateViaCQL(root.rootId, client);
+      : await enumerateViaCQL(root.rootId, client, root.state.last_sync);
     const seen = new Map<string, (typeof results)[number]>();
     for (const r of results) seen.set(r.id, r);
 
@@ -172,9 +179,15 @@ async function runSync(opts: { full: boolean; walkDb: boolean }): Promise<void> 
     const newPageIds = new Set(remaining.filter((p) => !root.state.pages[p.id]).map((p) => p.id));
     const updatedPageIds = new Set(remaining.filter((p) => root.state.pages[p.id]).map((p) => p.id));
 
-    root.state.total_watched_pages_on_remote = seen.size;
+    // `total_watched_pages_on_remote` is only meaningful after a full
+    // enumeration. On a filtered incremental we'd be writing "changed
+    // since last_sync" into a field that means "total in subtree" —
+    // confusing. Leave the previous value in place on incremental runs.
+    if (opts.includeNew || !root.state.last_sync || opts.reset) {
+      root.state.total_watched_pages_on_remote = seen.size;
+    }
     root.state.total_pages_downloaded = Object.keys(root.state.pages).length;
-    log.info(`${root.title}: ${seen.size} pages on remote; ${remaining.length} need fetching (${newPageIds.size} new, ${updatedPageIds.size} updated)`);
+    log.info(`${root.title}: ${seen.size} page(s) in enumeration; ${remaining.length} need fetching (${newPageIds.size} new, ${updatedPageIds.size} updated)`);
 
     const result = await downloadPages(
       remaining,
@@ -197,31 +210,37 @@ async function runSync(opts: { full: boolean; walkDb: boolean }): Promise<void> 
       syncIso,
     );
 
-    // Delete reconciliation. Every sync enumerates the full subtree (we no
-    // longer narrow by lastmodified), so anything in state but not in `seen`
-    // has been deleted, archived, or moved out of scope on Confluence.
-    const allIds = new Set(seen.keys());
-    const toDelete = Object.keys(root.state.pages).filter((id) => !allIds.has(id));
-    const deletedCount = toDelete.length;
-    for (const id of toDelete) {
-      const st = root.state.pages[id];
-      if (!st) continue;
-      const mdAbs = resolve(outputDir, st.path);
-      const htmlAbs = htmlPathFor(mdAbs);
-      try {
-        await rm(mdAbs, { force: true });
-        await rm(htmlAbs, { force: true });
-        // Collapse any now-empty parent folders. If this page was a parent
-        // (`<slug>--<id>/_index.md`) and its children were also deleted in
-        // this sync, the whole branch collapses cleanly instead of leaving
-        // a chain of empty directories.
-        await pruneEmptyParents(mdAbs, outputDir);
-        log.info(`removed deleted/archived page: ${st.title} (${id}) at ${st.path}`);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        log.warn(`orphan delete failed for ${id} (root ${root.rootId}): ${msg}`);
+    // Delete reconciliation only runs when we've seen the full subtree —
+    // i.e. `--includeNew` (DB walk) or a CQL run without the lastmodified
+    // filter (first run / after `--reset`). On a filtered incremental
+    // CQL we can't tell missing-from-result from never-edited, so we
+    // skip it and let the next --includeNew sweep catch any deletes.
+    const sawFullSubtree = opts.includeNew || !root.state.last_sync || opts.reset;
+    let deletedCount = 0;
+    if (sawFullSubtree) {
+      const allIds = new Set(seen.keys());
+      const toDelete = Object.keys(root.state.pages).filter((id) => !allIds.has(id));
+      deletedCount = toDelete.length;
+      for (const id of toDelete) {
+        const st = root.state.pages[id];
+        if (!st) continue;
+        const mdAbs = resolve(outputDir, st.path);
+        const htmlAbs = htmlPathFor(mdAbs);
+        try {
+          await rm(mdAbs, { force: true });
+          await rm(htmlAbs, { force: true });
+          // Collapse any now-empty parent folders. If this page was a parent
+          // (`<slug>--<id>/_index.md`) and its children were also deleted in
+          // this sync, the whole branch collapses cleanly instead of leaving
+          // a chain of empty directories.
+          await pruneEmptyParents(mdAbs, outputDir);
+          log.info(`removed deleted/archived page: ${st.title} (${id}) at ${st.path}`);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          log.warn(`orphan delete failed for ${id} (root ${root.rootId}): ${msg}`);
+        }
+        delete root.state.pages[id];
       }
-      delete root.state.pages[id];
     }
 
     if (result.errors.length === 0) {
@@ -285,8 +304,8 @@ async function runSync(opts: { full: boolean; walkDb: boolean }): Promise<void> 
 
   log.info(headline);
 
-  if (!opts.walkDb) {
-    log.info(`re-run this command after ~1 hour to get newly created pages, or run \`npm start -- --walkdb\` to ignore Confluence's index — this might take a bit longer.`);
+  if (!opts.includeNew) {
+    log.info(`latest modifications synced. Newly-created and deleted pages take ~1 hour to appear via the index — re-run later, or run \`npm start -- --includeNew\` to pick them up immediately (slower, walks the DB).`);
   }
 
   // Throttle stats — "of N HTTP requests, M had to back off." Useful to gauge
@@ -329,7 +348,7 @@ async function runReconvert(): Promise<void> {
 
   const allPages = Object.entries(mergedPages);
   if (allPages.length === 0) {
-    log.warn('no index files found; nothing to reconvert. Run `sync` or `refresh` first.');
+    log.warn('no index files found; nothing to reconvert. Run `npm start` first.');
     return;
   }
 
@@ -382,27 +401,28 @@ async function runReconvert(): Promise<void> {
 
 
 function usage(): void {
-  console.error('usage: npm start -- <sync|refresh|reconvert> [--walkdb]');
-  console.error('default (no args): sync — enumerate the full subtree via CQL/Lucene, fetch only pages whose version changed.');
-  console.error('--walkdb: bypass Confluence\'s Lucene index and enumerate directly from the DB via /child/page.');
-  console.error('         Slower (one API call per parent page) but sees newly-created pages immediately.');
+  console.error('usage: npm start -- [reconvert] [--includeNew] [--reset]');
+  console.error('default (no args): sync — CQL incremental, fetch only pages edited since last_sync.');
+  console.error('--includeNew: also pick up newly-created and deleted pages (DB walk, slower).');
+  console.error('--reset:      wipe state and re-download every page from scratch.');
+  console.error('reconvert:    regenerate every .md from the saved .html (no network).');
 }
 
 const [, , maybeCmd, ...rest] = process.argv;
-// `cmd` is the first non-flag arg; defaults to `sync`. `--walkdb` is a flag,
-// allowed alongside any verb (so `npm start -- --walkdb` and
-// `npm start -- refresh --walkdb` both work).
 const cmd = maybeCmd && !maybeCmd.startsWith('--') ? maybeCmd : 'sync';
 const flags = [maybeCmd, ...rest].filter((a): a is string => typeof a === 'string' && a.startsWith('--'));
-const walkDb = flags.includes('--walkdb');
+const includeNew = flags.includes('--includeNew');
+const reset = flags.includes('--reset');
+const helpRequested = flags.includes('--help') || flags.includes('-h');
 
 (async () => {
+  if (helpRequested) {
+    usage();
+    return;
+  }
   switch (cmd) {
     case 'sync':
-      await runSync({ full: false, walkDb });
-      break;
-    case 'refresh':
-      await runSync({ full: true, walkDb });
+      await runSync({ reset, includeNew });
       break;
     case 'reconvert':
       await runReconvert();
