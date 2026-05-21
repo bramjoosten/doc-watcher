@@ -16,9 +16,6 @@
 //    spacing equal to the sustainable refill interval; below 5%, we pause
 //    long enough for one token to refill. Goal: avoid hitting 429 in the
 //    first place rather than reacting after the fact.
-//
-// Bench is intentionally NOT using this — bench wants to measure absolute
-// burst tolerance at a fixed concurrency. Only the real sync benefits.
 
 import { log } from './log.ts';
 
