@@ -1,6 +1,6 @@
 import { appendFile, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { slugify } from './pathing.js';
+import { slugify } from './pathing.ts';
 
 export interface PageState {
   version: number;

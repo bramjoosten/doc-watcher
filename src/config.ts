@@ -1,11 +1,10 @@
-import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { resolve } from 'node:path';
-import { parse as parseYaml } from 'yaml';
+import { pathToFileURL } from 'node:url';
 import { z } from 'zod';
 
 // `~` is a shell construct; Node doesn't expand it. Doing it manually so users
-// can put `output_dir: ~/my-confluence-docs` in config.yaml without surprise.
+// can put `output_dir: '~/my-confluence-docs'` in config.ts without surprise.
 function expandTilde(p: string): string {
   if (p === '~') return homedir();
   if (p.startsWith('~/')) return `${homedir()}${p.slice(1)}`;
@@ -29,6 +28,11 @@ export const configSchema = z.object({
     .transform((v) => (Array.isArray(v) ? v : [v])),
 });
 
+// User-facing input shape — what you type in your config.ts. Use this with
+// `satisfies` to get autocomplete + a compile error if you typo a key.
+export type ConfigInput = z.input<typeof configSchema>;
+// Internal normalised shape — tilde-expanded paths, root_page_ids guaranteed
+// to be an array. Everything downstream of loadConfig uses this.
 export type Config = z.infer<typeof configSchema>;
 
 export interface LoadedConfig {
@@ -37,9 +41,28 @@ export interface LoadedConfig {
   rootDir: string;
 }
 
-export async function loadConfig(configPath = resolve(process.cwd(), 'config.yaml')): Promise<LoadedConfig> {
-  const raw = await readFile(configPath, 'utf8');
-  const parsed = parseYaml(raw);
-  const config = configSchema.parse(parsed);
+// Load the user's `config.ts` from the project root via dynamic import. The
+// file is a TS module the user edits directly — Node strips its types at
+// load time, so no separate parser/validator step is needed beyond the zod
+// schema, which validates the runtime shape and applies tilde expansion +
+// array normalisation.
+export async function loadConfig(
+  configPath = resolve(process.cwd(), 'config.ts'),
+): Promise<LoadedConfig> {
+  let mod: { default?: unknown };
+  try {
+    mod = (await import(pathToFileURL(configPath).href)) as { default?: unknown };
+  } catch (err) {
+    const cause = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `failed to load ${configPath}: ${cause}. Copy config.example.ts to config.ts and fill in the placeholders.`,
+    );
+  }
+  if (mod.default === undefined) {
+    throw new Error(
+      `${configPath} has no default export. The file should \`export default { ... } satisfies ConfigInput;\` — see config.example.ts.`,
+    );
+  }
+  const config = configSchema.parse(mod.default);
   return { config, configPath, rootDir: process.cwd() };
 }

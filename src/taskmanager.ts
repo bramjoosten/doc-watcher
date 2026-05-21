@@ -1,24 +1,24 @@
-#!/usr/bin/env -S npx tsx
+#!/usr/bin/env node
 // Disable TLS cert verification + silence the resulting warning. Must import
 // FIRST so it runs before any HTTPS connection is made.
-import './disable-tls-check.js';
+import './disable-tls-check.ts';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { AdaptiveLimiter } from './adaptive-limiter.js';
-import { loadConfig } from './config.js';
-import { ConfluenceClient } from './confluence.js';
-import { convertStorageFormat } from './converter.js';
+import { AdaptiveLimiter } from './adaptive-limiter.ts';
+import { loadConfig } from './config.ts';
+import { ConfluenceClient } from './confluence.ts';
+import { convertStorageFormat } from './converter.ts';
 import {
   buildConvertOptions,
   buildMarkdownBody,
   downloadPages,
   pickPageRelPath,
   titleIndexKey,
-} from './downloader.js';
-import { log } from './log.js';
-import { htmlPathFor, pruneEmptyParents } from './pathing.js';
-import { enumerateSubtree, enumerateViaCQL } from './walker.js';
+} from './downloader.ts';
+import { log } from './log.ts';
+import { htmlPathFor, pruneEmptyParents } from './pathing.ts';
+import { enumerateSubtree, enumerateViaCQL } from './walker.ts';
 import {
   appendIndexEntry,
   buildTree,
@@ -31,7 +31,7 @@ import {
   type StateFile,
   treePathFromIndexPath,
   writeTree,
-} from './state.js';
+} from './state.ts';
 
 // Default cap when the user hasn't set parallel_downloads in config.yaml.
 // The adaptive limiter starts at 1 anyway and ramps based on observed

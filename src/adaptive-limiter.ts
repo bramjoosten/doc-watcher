@@ -20,7 +20,7 @@
 // Bench is intentionally NOT using this — bench wants to measure absolute
 // burst tolerance at a fixed concurrency. Only the real sync benefits.
 
-import { log } from './log.js';
+import { log } from './log.ts';
 
 const LOW_BUDGET_RATIO = 0.2;
 const CRITICAL_BUDGET_RATIO = 0.05;

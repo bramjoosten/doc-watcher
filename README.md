@@ -7,15 +7,18 @@ Mirror Confluence Server pages to local files — raw HTML alongside converted M
 ```sh
 git clone https://code.bramjoosten.nl/bram/doc-watcher.git
 cd doc-watcher
+nvm use            # picks up .nvmrc → Node 24
 npm install
-cp config.example.yaml config.yaml
+cp config.example.ts config.ts
 ```
 
-Edit `config.yaml`:
+Edit `config.ts`:
 
 - `base_url` — your Confluence root URL
 - `pat` — Personal Access Token (creation steps are in the file's comment)
 - `root_page_ids` — one page id or a list; each is the root of a subtree to mirror
+
+`config.ts` is a TypeScript module — your editor will autocomplete the keys and flag typos thanks to the `satisfies ConfigInput` annotation at the bottom.
 
 ## Run
 
@@ -35,5 +38,21 @@ npm start -- --walkdb     # recursive /child/page walk — slower, but sees new 
 
 - `npm start -- refresh` — full re-download (ignores `last_sync`, reconciles deletes). Accepts `--walkdb`.
 - `npm start -- reconvert` — regenerate every `.md` from the saved `.html` (no network)
+
+## Risk profile
+
+This tool runs locally with your Confluence PAT and writes to your filesystem. The PAT inherits your full Confluence read-permissions, so anything that can hijack the process can read what you can read. A few choices keep the attack surface small:
+
+- **No transpiler at runtime.** Node 24 strips TypeScript types natively, so there's no `tsx` / `esbuild` / platform-specific prebuilt binary in the dependency tree. The `.nvmrc` pins to 24.
+- **Three runtime dependencies, all single-package and mainline.** `cheerio` (XHTML parsing — its transitive tree is wide but well-audited), `zod` (config validation), and Node's built-in `fetch` (no separate HTTP library). YAML, env-loaders, CLI frameworks, loggers, test runners — all replaced by stdlib or ~20 lines of in-house code.
+- **No native modules.** Everything is pure JavaScript. Corporate machines with MITM npm proxies and locked-down compilers can install cleanly. Equally: there's no native code path that could ship a compromised binary.
+- **Config is a TypeScript module you write yourself.** No YAML/JSON/TOML parser, no `.env`, no env-var indirection. Your PAT lives in `config.ts`, gitignored.
+- **TLS verification is disabled process-wide.** Deliberate: corporate Confluence instances often sit behind private CAs and asking every user to wrangle a PEM bundle is worse. The deliberate scope is a single-user CLI talking to a Confluence on a network you already trust. Don't point this at an untrusted host.
+- **Outbound traffic goes to exactly one origin: your Confluence `base_url`.** No telemetry, no analytics, no auto-update check.
+
+Two things to be aware of when auditing:
+
+- `cheerio` pulls in ~15 transitive packages (htmlparser2, parse5, domhandler/domutils, undici, etc.). If you want to lock those, run `npm ci` against a committed `package-lock.json`.
+- The dev-only `typescript` and `@types/node` aren't run with your PAT — they only execute under `npm run typecheck`.
 
 See [`CLAUDE.md`](./CLAUDE.md) for the full spec — output layout, file formats, frontmatter shape, adaptive concurrency, limitations.

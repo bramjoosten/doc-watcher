@@ -2,7 +2,7 @@
 
 A local watcher script that mirrors a Confluence Server (on-prem) tree to disk so it can be searched and queried by IDE's and local AI. Authenticates with a user-level Personal Access Token, downloads in parallel with adaptive concurrency, and re-runs incrementally — every run re-enumerates the full subtree metadata, but only pages whose `version` has changed actually get re-fetched.
 
-Node.js, TypeScript, run via `tsx`.
+Node.js 24, TypeScript, run directly via Node's built-in type stripping — no transpiler, no build step.
 
 ## Requirements
 
@@ -22,12 +22,12 @@ Node.js, TypeScript, run via `tsx`.
 
 ### Stack
 
-- **Node 22+** with **TypeScript**, run via `tsx` in dev (no build step).
-- Built-in `fetch` (undici); a 15-line inline `pLimit` helper for bounded-concurrency parallel downloads.
+- **Node 24+** with **TypeScript**. Node strips TS types natively (stable from 22.18 / on by default from 23.6), so we run `node src/taskmanager.ts` directly — no `tsx`, no `esbuild`, no build step. `.nvmrc` pins to `24`.
+- Built-in `fetch` (undici, bundled with Node); a 15-line inline `pLimit` helper for bounded-concurrency parallel downloads.
 - `cheerio` for parsing Confluence storage-format XHTML.
 - In-house HTML→Markdown walker in `converter.ts` (no `turndown` — DOM-lib transitive deps kept tripping corp security scanners).
-- `zod` for typed config validation; `yaml` for YAML parsing.
-- Credentials live in `config.yaml` directly — no `.env` file, no env-var indirection.
+- `zod` for typed config validation.
+- Config is a TypeScript module (`config.ts` at the project root, gitignored) that the user edits directly — no YAML parser, no `.env` file. The schema in `src/config.ts` exports a `ConfigInput` type, and the user's `config.ts` ends with `} satisfies ConfigInput` so typos surface in the editor instead of at runtime.
 
 **Minimize third-party dependencies.** Reach for the Node standard library first; a dep only earns its keep when the alternative would be hundreds of lines of nontrivial code (XHTML parsing, HTML→markdown conversion). **No native modules** — the tool has to install on locked-down corporate machines where the npm proxy MITMs TLS and prebuilt binaries fail to download. Pure JavaScript across the board. The CLI is a plain Node entry point using `process.argv` — no `commander` / `yargs` / etc. Logging is `console.log` / `console.error`. No test framework for now.
 
@@ -61,9 +61,10 @@ doc-watcher/
 ├── package.json
 ├── tsconfig.json
 ├── README.md
-├── config.example.yaml
-├── config.yaml                     # gitignored — base_url, pat, root_page_ids, etc.
-├── .gitignore                      # ignores config.yaml, docs/, .claude/, node_modules/
+├── .nvmrc                          # `24` — Node version pinned so type-stripping is stable
+├── config.example.ts               # template the user copies to config.ts
+├── config.ts                       # gitignored — TS module with base_url, pat, root_page_ids, etc.
+├── .gitignore                      # ignores config.ts, docs/, .claude/, node_modules/
 └── src/
     ├── taskmanager.ts              # entry point: sync / refresh / reconvert
     ├── config.ts                   # zod schema, YAML loader
@@ -130,7 +131,7 @@ Fast (one paginated call covers ~100 pages per request) and good enough for the 
 - `GET /rest/api/content/{id}/child/attachment?expand=version` — attachment list.
 - `GET /download/attachments/{pageId}/{filename}` — binary download.
 
-Auth: `Authorization: Bearer <pat from config.yaml>` on every request.
+Auth: `Authorization: Bearer <pat from config.ts>` on every request.
 
 TLS certificate verification is disabled process-wide (`NODE_TLS_REJECT_UNAUTHORIZED=0`, set in `src/disable-tls-check.ts` which is imported first). Corporate Confluence instances often sit behind private CAs that Node doesn't trust out of the box; rather than asking every user to wrangle a PEM bundle, doc-watcher just skips cert verification. The deliberate scope: a single-user CLI talking to a Confluence on a network you already trust. The warning Node would otherwise print on every HTTPS connection is filtered out by patching `process.emitWarning`.
 
@@ -150,11 +151,11 @@ Verbs:
 - **`refresh`**: same as `sync` but ignores `last_sync` (full re-download).
 - **`reconvert`**: walk every `.html` already on disk and regenerate the `.md` next to it. No network calls. Used after a converter change.
 
-Setup is manual: copy `config.example.yaml` → `config.yaml` and fill in the placeholders (`base_url`, `pat`, at least one `root_page_ids` entry). The YAML is intentionally flat — every key sits at the top level. `root_page_ids` accepts either a single string or a list of strings; each is a Confluence page id whose subtree gets mirrored.
+Setup is manual: copy `config.example.ts` → `config.ts` and fill in the placeholders (`base_url`, `pat`, at least one `root_page_ids` entry). The shape is intentionally flat — every key sits at the top level of the default export. `root_page_ids` accepts either a single string or a list of strings; each is a Confluence page id whose subtree gets mirrored. The `satisfies ConfigInput` annotation at the bottom turns typos into compile-time errors.
 
 ### Concurrency: adaptive limiter informed by server headers
 
-`parallel_downloads` in `config.yaml` is an *upper ceiling*, not a target. For the body-download phase the adaptive limiter starts at concurrency = 1 (slow-start), doubles every 50 sustained successes up to the ceiling, and halves immediately on every 429-wave. `Retry-After` becomes a minimum inter-request spacing for the next window. The `--walkdb` subtree walk (`/child/page` paging) calls `limiter.warmUp(maxCapacity)` first — those calls are cheap metadata lookups, not real load, and a wide BFS level otherwise drags through one connection during slow-start. The 429 halving and budget-aware throttling stay in force after the warm-up, so the safety net is intact.
+`parallel_downloads` in `config.ts` is an *upper ceiling*, not a target. For the body-download phase the adaptive limiter starts at concurrency = 1 (slow-start), doubles every 50 sustained successes up to the ceiling, and halves immediately on every 429-wave. `Retry-After` becomes a minimum inter-request spacing for the next window. The `--walkdb` subtree walk (`/child/page` paging) calls `limiter.warmUp(maxCapacity)` first — those calls are cheap metadata lookups, not real load, and a wide BFS level otherwise drags through one connection during slow-start. The 429 halving and budget-aware throttling stay in force after the warm-up, so the safety net is intact.
 
 On top of that reactive AIMD, the client reads Confluence DC's `X-RateLimit-*` headers (`Limit`, `Remaining`, `Interval-Seconds`, `FillRate`) on *every* authenticated response and feeds them to the limiter. When `remaining/limit` drops below 20%, the limiter paces new requests at the sustainable refill rate (`intervalSeconds / fillRate`); below 5%, it pauses long enough for at least one token to refill. Goal: avoid hitting 429 in the first place rather than reacting after the fact. The first observed budget is also logged so you see what your server actually allows (e.g. *"50-token bucket, fills at 10/60s = 0.17 req/s sustainable"*).
 

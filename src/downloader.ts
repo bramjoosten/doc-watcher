@@ -1,10 +1,10 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join, posix } from 'node:path';
-import { AdaptiveLimiter } from './adaptive-limiter.js';
-import type { Config } from './config.js';
-import type { ConfluenceAttachment, ConfluenceClient, ConfluencePage } from './confluence.js';
-import { convertStorageFormat } from './converter.js';
-import { log } from './log.js';
+import { AdaptiveLimiter } from './adaptive-limiter.ts';
+import type { Config } from './config.ts';
+import type { ConfluenceAttachment, ConfluenceClient, ConfluencePage } from './confluence.ts';
+import { convertStorageFormat } from './converter.ts';
+import { log } from './log.ts';
 import {
   attachmentPath,
   attachmentRelativeForPage,
@@ -12,8 +12,8 @@ import {
   htmlPathFor,
   leafPath,
   spaceIndexPath,
-} from './pathing.js';
-import type { PageState, StateFile } from './state.js';
+} from './pathing.ts';
+import type { PageState, StateFile } from './state.ts';
 
 export interface DownloadOptions {
   config: Config;

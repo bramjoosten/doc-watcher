@@ -1,4 +1,4 @@
-import { log } from './log.js';
+import { log } from './log.ts';
 
 export interface RateLimitBudget {
   limit: number;            // X-RateLimit-Limit

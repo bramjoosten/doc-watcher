@@ -1,6 +1,6 @@
-import type { AdaptiveLimiter } from './adaptive-limiter.js';
-import type { ConfluenceClient, ConfluencePage } from './confluence.js';
-import { log } from './log.js';
+import type { AdaptiveLimiter } from './adaptive-limiter.ts';
+import type { ConfluenceClient, ConfluencePage } from './confluence.ts';
+import { log } from './log.ts';
 
 export interface SubtreeEnumeration {
   // Every page in the subtree, including the root. Each entry has version
