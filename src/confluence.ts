@@ -155,10 +155,7 @@ export class ConfluenceClient {
         this.notifyBudget(res.headers);
         if (backedOff && res.ok) {
           this.requestsRecoveredAfterBackoff++;
-          log.info(
-            { url: shortUrl, attempts: attempt + 1 },
-            `recovered after backoff: ${shortUrl} succeeded on attempt ${attempt + 1}`,
-          );
+          log.info(`recovered after backoff: ${shortUrl} succeeded on attempt ${attempt + 1}`);
         }
         return res;
       }
@@ -182,10 +179,7 @@ export class ConfluenceClient {
       const cooldownAlreadyActive = Date.now() < this.throttledUntilMs;
       this.throttledUntilMs = Math.max(this.throttledUntilMs, Date.now() + waitMs);
       if (!cooldownAlreadyActive) {
-        log.warn(
-          { status: res.status, url: shortUrl, attempt: attempt + 1, waitMs, body: bodySnippet || undefined },
-          `rate limited (${res.status} ${res.statusText}) for ${shortUrl}: ${bodySnippet || '(no body)'} — backing off ${waitMs}ms`,
-        );
+        log.warn(`rate limited (${res.status} ${res.statusText}) for ${shortUrl} on attempt ${attempt + 1}: ${bodySnippet || '(no body)'} — backing off ${waitMs}ms`);
         this.rateLimitObserver?.report429(waitMs);
       }
       await new Promise<void>((r) => setTimeout(r, waitMs));
@@ -246,6 +240,32 @@ export class ConfluenceClient {
     if (expand.length) params.set('expand', expand.join(','));
     const path = `/rest/api/content/${encodeURIComponent(id)}?${params.toString()}`;
     return this.request<ConfluencePage>(path, undefined, opts);
+  }
+
+  // CQL-based page enumeration via /rest/api/content/search. Routes through
+  // Lucene, so it's fast (one paginated call per root, ~1 request per 100
+  // pages) but limited by index health: brand-new pages may not show up
+  // until the background indexer catches up — Atlassian docs put that on
+  // the order of an hour for a busy instance. Used by the default `sync`
+  // verb. For guaranteed-immediate visibility of new pages, callers should
+  // fall back to the DB-backed /child/page walker instead.
+  async searchByCQL(cql: string, expand: string[] = ['version']): Promise<ConfluencePage[]> {
+    const params = new URLSearchParams();
+    params.set('cql', cql);
+    params.set('limit', '100');
+    if (expand.length) params.set('expand', expand.join(','));
+    const path = `/rest/api/content/search?${params.toString()}`;
+    const out: ConfluencePage[] = [];
+    log.info(`CQL: ${cql}`);
+    const started = Date.now();
+    for await (const item of this.paginate<ConfluencePage>(path)) {
+      out.push(item);
+      if (out.length % 100 === 0) {
+        log.info(`CQL: ${out.length} pages listed so far (${Date.now() - started}ms elapsed)`);
+      }
+    }
+    log.info(`CQL: ${out.length} pages returned in ${Date.now() - started}ms`);
+    return out;
   }
 
   // Direct children of a page via Confluence's DB-backed child endpoint.

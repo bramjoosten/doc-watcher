@@ -67,10 +67,7 @@ export class AdaptiveLimiter {
     const prev = this.capacity;
     this.capacity = Math.min(this.max, Math.max(1, target));
     if (this.capacity > prev) {
-      log.info(
-        { from: prev, to: this.capacity, max: this.max },
-        `limiter warm-up: capacity ${prev} → ${this.capacity}`,
-      );
+      log.info(`limiter warm-up: capacity ${prev} → ${this.capacity} (max ${this.max})`);
       this.tryWake();
     }
   }
@@ -124,10 +121,7 @@ export class AdaptiveLimiter {
     if (!this.firstBudgetLogged) {
       this.firstBudgetLogged = true;
       const perSec = budget.fillRate / budget.intervalSeconds;
-      log.info(
-        { ...budget, sustainableRequestsPerSecond: perSec },
-        `server rate limit: ${budget.limit}-token bucket, fills at ${budget.fillRate}/${budget.intervalSeconds}s = ${perSec.toFixed(2)} req/s sustainable`,
-      );
+      log.info(`server rate limit: ${budget.limit}-token bucket, ${budget.remaining} remaining, fills at ${budget.fillRate}/${budget.intervalSeconds}s = ${perSec.toFixed(2)} req/s sustainable`);
     }
 
     const ratio = budget.remaining / budget.limit;

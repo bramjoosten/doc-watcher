@@ -223,7 +223,8 @@ async function fetchAndWriteOne(
             await writeFile(dest, Buffer.from(buf));
             attachmentRefs.push(attachmentPath(spaceKey, page.id, img.filename));
           } catch (err) {
-            log.warn({ err, page: page.id, filename: img.filename }, 'attachment download failed');
+            const msg = err instanceof Error ? err.message : String(err);
+            log.warn(`attachment download failed for ${img.filename} (page ${page.id}): ${msg}`);
           }
         }),
       ),
@@ -296,10 +297,7 @@ export async function downloadPages(pages: ConfluencePage[], opts: DownloadOptio
 
           const now = Date.now();
           if (now - lastProgressAt >= PROGRESS_INTERVAL_MS) {
-            log.info(
-              { downloaded: written.length, of: total },
-              `progress: ${written.length} of ${total} downloaded`,
-            );
+            log.info(`progress: ${written.length} of ${total} downloaded`);
             lastProgressAt = now;
           }
           // Persist after every successful page so an interrupt is recoverable.
@@ -310,11 +308,13 @@ export async function downloadPages(pages: ConfluencePage[], opts: DownloadOptio
             try {
               await opts.flushState(detailed.id);
             } catch (err) {
-              log.warn({ err, id: detailed.id }, 'failed to flush state mid-sync (will retry on next page)');
+              const msg = err instanceof Error ? err.message : String(err);
+              log.warn(`failed to flush state mid-sync for ${detailed.id} (will retry on next page): ${msg}`);
             }
           }
         } catch (err) {
-          log.error({ err, id: page.id }, 'page fetch failed');
+          const msg = err instanceof Error ? err.message : String(err);
+          log.error(`page fetch failed for ${page.id}: ${msg}`);
           errors.push({ id: page.id, error: err });
         }
       }),

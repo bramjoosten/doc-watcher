@@ -68,7 +68,7 @@ doc-watcher/
     ├── taskmanager.ts              # entry point: sync / refresh / reconvert
     ├── config.ts                   # zod schema, YAML loader
     ├── confluence.ts               # REST client (typed wrappers around fetch)
-    ├── walker.ts                   # BFS subtree walk via /child/page (DB-backed)
+    ├── walker.ts                   # subtree enumeration: CQL fast path + /child/page DB walk
     ├── downloader.ts               # parallel fetch + write, p-limit-bounded
     ├── converter.ts                # storage-format → markdown: cheerio macro pre-pass + in-house walker
     ├── pathing.ts                  # title → slug, rename detection
@@ -104,21 +104,29 @@ docs/
 
 ### Change detection
 
-Confluence Server has no dedicated sync endpoint. We enumerate each configured root by walking its subtree level-by-level via Confluence's DB-backed child endpoint:
+Confluence Server has no dedicated sync endpoint. We have two enumeration strategies, with the choice driven by the `--walkdb` flag:
 
-- `GET /rest/api/content/{rootId}?expand=version,space,ancestors` — root page itself.
-- `GET /rest/api/content/{parentId}/child/page?expand=version` — direct children of each parent. One call per parent page, recursed level by level. Calls within a BFS level are issued in parallel through the adaptive limiter.
+**Default (CQL/Lucene).** One paginated call per root, `expand=version,space,ancestors`:
 
-The walker stitches each child's ancestor chain together locally (`child.ancestors = parent.ancestors + parent`) and inherits `space` from the root, so the per-page response only needs `expand=version`. The per-page `version` is then diffed against the local index: pages with a higher version (or no entry in state) get fetched with `expand=body.storage`; everything else is skipped. New pages, edits, renames, re-parents and deletes all fall out of this single mechanism.
+```
+GET /rest/api/content/search?cql=(id = N OR ancestor = N) AND type = page&expand=version,space,ancestors
+```
 
-**Why a recursive `/child/page` walk, not `/descendant/page` or CQL?** Earlier iterations used `/rest/api/content/search` (CQL) — but that endpoint goes through Lucene, which on a real instance lagged page creation by 20+ minutes and made new pages invisible to both CQL and the in-app search bar. We then switched to `/rest/api/content/{id}/descendant/page` — same DB-backed correctness, in one paginated call — but `expand=ancestors` on that endpoint 500'd on real subtrees because Confluence eagerly built the full ancestor chain for every result. The recursive `/child/page` walk avoids both problems: each call is a single parent_id lookup (cheap on the server, no Lucene), and we synthesize ancestors locally so we never ask Confluence to do it. Trade-off: more API calls (~1 per parent page vs. ~1 per 100 descendants total). At realistic single-user scale that's not noticeable, and the adaptive limiter caps concurrency at whatever the server actually wants.
+Fast (one paginated call covers ~100 pages per request) and good enough for the common case: an edit to an existing page triggers a synchronous per-page reindex, so the new version is visible to CQL immediately. The downside is new-page *creation*: those go through the background indexer, which on a real instance can lag the database by up to ~1 hour. Atlassian's content-index-administration KB documents this. The end of every CQL-mode run logs a hint: re-run after ~1h, or switch to `--walkdb`.
 
-**Deletes.** A page that's been deleted or archived in Confluence stops appearing as a child of its former parent. Anything in the local index but not in the latest enumeration falls into the orphan set; both its `.html` and `.md` are removed from disk, the state entry is dropped, and any parent folder that's been left empty is `rmdir`'d (walking up until we hit a non-empty directory or the output root).
+**`--walkdb` (DB walk, opt-in).** A recursive `/rest/api/content/{id}/child/page` walk: one call per parent page in the subtree, BFS, scheduled through the adaptive limiter as a streaming pool (no per-level barrier, so a slow parent doesn't freeze its level's siblings). The walker stitches each child's ancestor chain together locally (`child.ancestors = parent.ancestors + parent`) and inherits `space` from the root, so the per-page response only needs `expand=version`. Hits the content table directly — no Lucene involvement — so newly-created pages show up immediately. The cost: more API calls (~1 per parent page vs. ~1 per 100 pages on CQL), but the limiter warms straight to its ceiling for this phase (it's metadata-only, not the heavy body fetches slow-start was designed for) and 429 halving stays in force.
+
+**Once enumerated, both paths feed the same downstream pipeline.** The per-page `version` returned by the API is diffed against the local index: pages with a higher version (or no entry in state) get fetched with `expand=body.storage`; everything else is skipped. New pages, edits, renames, re-parents and deletes all fall out of this single mechanism.
+
+**Why not /descendant/page?** An interim attempt used `/rest/api/content/{id}/descendant/page` with `expand=version,space,ancestors` — also DB-backed, in a single paginated call. It 500'd on real subtrees: Confluence eagerly built the full ancestor chain for every result and the combined cost exceeded the endpoint's budget. The recursive `/child/page` walk synthesizes ancestors client-side and so never asks for the expensive expand.
+
+**Deletes.** A page that's been deleted or archived in Confluence stops appearing in the enumeration (whether CQL or DB walk). Anything in the local index but not in the latest enumeration falls into the orphan set; both its `.html` and `.md` are removed from disk, the state entry is dropped, and any parent folder that's been left empty is `rmdir`'d (walking up until we hit a non-empty directory or the output root). Caveat: a brand-new restriction can look like a delete in CQL mode if the page hasn't been reindexed yet.
 
 ### Confluence REST endpoints used
 
-- `GET /rest/api/content/{id}/child/page?expand=version&limit=100` — direct children of a page (DB-backed, bypasses Lucene). Called recursively through the subtree by `walker.ts`.
-- `GET /rest/api/content/{id}?expand=body.storage,version,ancestors,space` — full page (storage-format XHTML). Also used to fetch the root page itself.
+- `GET /rest/api/content/search?cql=...&expand=version,space,ancestors&limit=100` — default subtree enumeration via CQL/Lucene. Paginated.
+- `GET /rest/api/content/{id}/child/page?expand=version&limit=100` — direct children of a page (DB-backed, bypasses Lucene). Called recursively through the subtree by the `--walkdb` path in `walker.ts`.
+- `GET /rest/api/content/{id}?expand=body.storage,version,ancestors,space` — full page (storage-format XHTML). Also used to fetch the root page itself in `--walkdb` mode.
 - `GET /rest/api/content/{id}/child/attachment?expand=version` — attachment list.
 - `GET /download/attachments/{pageId}/{filename}` — binary download.
 
@@ -138,7 +146,7 @@ Always deterministic, always replayable. The `.html` file on disk is what the co
 
 Verbs:
 
-- **`sync`** (default): recursively walk the subtree via `/rest/api/content/{id}/child/page` (one call per parent, BFS, gated by the adaptive limiter), diff each page's version against state, fetch any new-or-changed pages in parallel with `expand=body.storage,version,ancestors,space`, write both `.html` and `.md`, atomic state-file replace at the end.
+- **`sync`** (default): enumerate the subtree via CQL (fast path, Lucene-backed). With `--walkdb`, enumerate via recursive `/child/page` walk instead (slower, but sees newly-created pages immediately). Either way: diff each page's version against state, fetch any new-or-changed pages in parallel with `expand=body.storage,version,ancestors,space`, write both `.html` and `.md`, atomic state-file replace at the end. CQL-mode runs print a hint at the bottom about re-running after ~1h or using `--walkdb` to bypass the index.
 - **`refresh`**: same as `sync` but ignores `last_sync` (full re-download).
 - **`reconvert`**: walk every `.html` already on disk and regenerate the `.md` next to it. No network calls. Used after a converter change.
 
@@ -146,7 +154,7 @@ Setup is manual: copy `config.example.yaml` → `config.yaml` and fill in the pl
 
 ### Concurrency: adaptive limiter informed by server headers
 
-`parallel_downloads` in `config.yaml` is an *upper ceiling*, not a target. For the body-download phase the adaptive limiter starts at concurrency = 1 (slow-start), doubles every 50 sustained successes up to the ceiling, and halves immediately on every 429-wave. `Retry-After` becomes a minimum inter-request spacing for the next window. The subtree-walking phase (`/child/page` paging) calls `limiter.warmUp(maxCapacity)` first — those calls are cheap metadata lookups, not real load, and a wide BFS level otherwise drags through one connection during slow-start. The 429 halving and budget-aware throttling stay in force after the warm-up, so the safety net is intact.
+`parallel_downloads` in `config.yaml` is an *upper ceiling*, not a target. For the body-download phase the adaptive limiter starts at concurrency = 1 (slow-start), doubles every 50 sustained successes up to the ceiling, and halves immediately on every 429-wave. `Retry-After` becomes a minimum inter-request spacing for the next window. The `--walkdb` subtree walk (`/child/page` paging) calls `limiter.warmUp(maxCapacity)` first — those calls are cheap metadata lookups, not real load, and a wide BFS level otherwise drags through one connection during slow-start. The 429 halving and budget-aware throttling stay in force after the warm-up, so the safety net is intact.
 
 On top of that reactive AIMD, the client reads Confluence DC's `X-RateLimit-*` headers (`Limit`, `Remaining`, `Interval-Seconds`, `FillRate`) on *every* authenticated response and feeds them to the limiter. When `remaining/limit` drops below 20%, the limiter paces new requests at the sustainable refill rate (`intervalSeconds / fillRate`); below 5%, it pauses long enough for at least one token to refill. Goal: avoid hitting 429 in the first place rather than reacting after the fact. The first observed budget is also logged so you see what your server actually allows (e.g. *"50-token bucket, fills at 10/60s = 0.17 req/s sustainable"*).
 

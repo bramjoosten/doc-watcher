@@ -28,7 +28,7 @@ export async function enumerateSubtree(
   limiter: AdaptiveLimiter,
 ): Promise<SubtreeEnumeration> {
   const started = Date.now();
-  log.info({ rootId }, 'walking subtree via /child/page (DB-backed, streaming pool)');
+  log.info(`walking subtree under root ${rootId} via /child/page (DB-backed, streaming pool)`);
 
   // /child/page is a cheap parent_id lookup against the content table —
   // not the heavy body download the limiter's slow-start was designed
@@ -73,14 +73,7 @@ export async function enumerateSubtree(
   // making forward progress?).
   const progressTimer = setInterval(() => {
     log.info(
-      {
-        walked: pages.length,
-        parentsFetched,
-        inFlight: pending.size,
-        limiterCapacity: limiter.currentCapacity,
-        elapsedMs: Date.now() - started,
-      },
-      `walking: ${pages.length} pages discovered, ${parentsFetched} parents fetched, ${pending.size} in flight, limiter at ${limiter.currentCapacity}`,
+      `walking: ${pages.length} discovered, ${parentsFetched} parents fetched, ${pending.size} in flight, limiter at ${limiter.currentCapacity}, ${Math.round((Date.now() - started) / 1000)}s elapsed`,
     );
   }, 5000);
 
@@ -96,14 +89,30 @@ export async function enumerateSubtree(
     clearInterval(progressTimer);
   }
 
-  log.info(
-    {
-      rootId,
-      total: pages.length,
-      parents: pagesWithChildren.size,
-      elapsedMs: Date.now() - started,
-    },
-    `walked ${pages.length} pages (${pagesWithChildren.size} parents) in ${Date.now() - started}ms`,
-  );
+  log.info(`walked ${pages.length} pages (${pagesWithChildren.size} parents) under root ${rootId} in ${Date.now() - started}ms`);
+  return { pages, pagesWithChildren };
+}
+
+// Fast path: one paginated CQL call per root, returning the whole subtree
+// plus the version/ancestors/space metadata in one shot. Routes through
+// Lucene, so brand-new pages may be invisible for ~an hour until the
+// background indexer catches them — see Atlassian's content-index-
+// administration KB. Default for `sync` because edits to existing pages
+// fire the per-page reindex synchronously and so are reflected instantly.
+// Callers needing immediate visibility of new pages should use the DB
+// walk (`enumerateSubtree`) instead.
+export async function enumerateViaCQL(
+  rootId: string,
+  client: ConfluenceClient,
+): Promise<SubtreeEnumeration> {
+  const cql = `(id = ${rootId} OR ancestor = ${rootId}) AND type = page`;
+  const pages = await client.searchByCQL(cql, ['version', 'space', 'ancestors']);
+  // pagesWithChildren = the union of every page's ancestor-ids. Anything
+  // that shows up as someone else's ancestor must itself have at least
+  // one child.
+  const pagesWithChildren = new Set<string>();
+  for (const page of pages) {
+    for (const a of page.ancestors ?? []) pagesWithChildren.add(a.id);
+  }
   return { pages, pagesWithChildren };
 }

@@ -18,7 +18,7 @@ import {
 } from './downloader.js';
 import { log } from './log.js';
 import { htmlPathFor, pruneEmptyParents } from './pathing.js';
-import { enumerateSubtree } from './walker.js';
+import { enumerateSubtree, enumerateViaCQL } from './walker.js';
 import {
   appendIndexEntry,
   buildTree,
@@ -79,7 +79,7 @@ async function resolveRoot(
   };
 }
 
-async function runSync(opts: { full: boolean }): Promise<void> {
+async function runSync(opts: { full: boolean; walkDb: boolean }): Promise<void> {
   const { config, rootDir } = await loadConfig();
   const outputDir = resolve(rootDir, config.output_dir);
   await mkdir(outputDir, { recursive: true });
@@ -90,8 +90,7 @@ async function runSync(opts: { full: boolean }): Promise<void> {
   const oldStatePath = resolve(outputDir, '.state.json');
   if (existsSync(oldStatePath)) {
     log.warn(
-      { oldStatePath },
-      `found legacy .state.json from before per-root indexes — ignored. Run \`npm start -- refresh\` to rebuild as per-root index files, then delete .state.json.`,
+      `found legacy .state.json at ${oldStatePath} from before per-root indexes — ignored. Run \`npm start -- refresh\` to rebuild as per-root index files, then delete .state.json.`,
     );
   }
 
@@ -101,10 +100,7 @@ async function runSync(opts: { full: boolean }): Promise<void> {
   // server's budget gets low.
   const parallelCap = config.parallel_downloads ?? DEFAULT_PARALLEL_DOWNLOADS;
   const adaptiveLimiter = new AdaptiveLimiter({ max: parallelCap, slowStart: true });
-  log.info(
-    { maxConcurrency: parallelCap, startingConcurrency: adaptiveLimiter.currentCapacity },
-    `adaptive concurrency: starting at ${adaptiveLimiter.currentCapacity}, ramping toward ${parallelCap} on sustained success`,
-  );
+  log.info(`adaptive concurrency: starting at ${adaptiveLimiter.currentCapacity}, ramping toward ${parallelCap} on sustained success`);
 
   const client = new ConfluenceClient({
     baseUrl: config.base_url,
@@ -118,17 +114,10 @@ async function runSync(opts: { full: boolean }): Promise<void> {
     roots.push(await resolveRoot(outputDir, rootId, client, opts.full));
   }
   const totalLocal = roots.reduce((acc, r) => acc + Object.keys(r.state.pages).length, 0);
-  log.info(
-    {
-      roots: roots.map((r) => ({
-        id: r.rootId,
-        title: r.title,
-        pages: Object.keys(r.state.pages).length,
-        last_sync: r.state.last_sync,
-      })),
-    },
-    `loaded ${roots.length} root index file(s) — ${totalLocal} pages already on disk`,
-  );
+  const rootSummary = roots
+    .map((r) => `"${r.title}" (${r.rootId}, ${Object.keys(r.state.pages).length} pages, last_sync=${r.state.last_sync ?? 'never'})`)
+    .join('; ');
+  log.info(`loaded ${roots.length} root index file(s) — ${totalLocal} pages already on disk: ${rootSummary}`);
 
   // Configured root ids — used by pickPageRelPath to trim ancestor folders
   // above the root so the on-disk tree starts where the user said to.
@@ -159,13 +148,17 @@ async function runSync(opts: { full: boolean }): Promise<void> {
   const allErrorSummary: Record<string, number> = {};
 
   for (const root of roots) {
-    log.info({ rootId: root.rootId, title: root.title }, `syncing root "${root.title}" (${root.rootId})`);
+    log.info(`syncing root "${root.title}" (${root.rootId}) via ${opts.walkDb ? 'DB walk (slow, immediate)' : 'CQL/Lucene (fast, ~1h lag on new pages)'}`);
 
-    // Recursive walk via /child/page (DB-backed, bypasses Lucene). The walker
-    // synthesises each page's ancestor chain locally from its parent's chain,
-    // so we never need `expand=ancestors` — which 500'd on /descendant/page
-    // because Confluence eagerly built the full chain for every descendant.
-    const { pages: results, pagesWithChildren } = await enumerateSubtree(root.rootId, client, adaptiveLimiter);
+    // Two enumeration strategies. Default is CQL: one paginated call per root,
+    // routes through Lucene, so brand-new pages may be invisible for an hour
+    // (existing-page edits show up instantly because they trigger a per-page
+    // reindex). The `--walkdb` flag opts in to a recursive /child/page walk
+    // that hits the DB directly and sees new pages immediately, at the cost
+    // of more API calls.
+    const { pages: results, pagesWithChildren } = opts.walkDb
+      ? await enumerateSubtree(root.rootId, client, adaptiveLimiter)
+      : await enumerateViaCQL(root.rootId, client);
     const seen = new Map<string, (typeof results)[number]>();
     for (const r of results) seen.set(r.id, r);
 
@@ -184,10 +177,7 @@ async function runSync(opts: { full: boolean }): Promise<void> {
 
     root.state.total_watched_pages_on_remote = seen.size;
     root.state.total_pages_downloaded = Object.keys(root.state.pages).length;
-    log.info(
-      { rootId: root.rootId, candidates: seen.size, remaining: remaining.length, new: newPageIds.size, updated: updatedPageIds.size },
-      `${root.title}: ${seen.size} pages on remote; ${remaining.length} need fetching`,
-    );
+    log.info(`${root.title}: ${seen.size} pages on remote; ${remaining.length} need fetching (${newPageIds.size} new, ${updatedPageIds.size} updated)`);
 
     const result = await downloadPages(
       remaining,
@@ -229,9 +219,10 @@ async function runSync(opts: { full: boolean }): Promise<void> {
         // this sync, the whole branch collapses cleanly instead of leaving
         // a chain of empty directories.
         await pruneEmptyParents(mdAbs, outputDir);
-        log.info({ rootId: root.rootId, id, path: st.path, title: st.title }, `removed deleted/archived page: ${st.title} (${id})`);
+        log.info(`removed deleted/archived page: ${st.title} (${id}) at ${st.path}`);
       } catch (err) {
-        log.warn({ rootId: root.rootId, err, id }, 'orphan delete failed');
+        const msg = err instanceof Error ? err.message : String(err);
+        log.warn(`orphan delete failed for ${id} (root ${root.rootId}): ${msg}`);
       }
       delete root.state.pages[id];
     }
@@ -239,10 +230,7 @@ async function runSync(opts: { full: boolean }): Promise<void> {
     if (result.errors.length === 0) {
       root.state.last_sync = syncIso;
     } else {
-      log.warn(
-        { rootId: root.rootId, errors: result.errors.length, lastSyncFrozen: root.state.last_sync ?? '(none)' },
-        `${root.title}: last_sync NOT advanced because ${result.errors.length} page(s) failed; they'll be retried next run`,
-      );
+      log.warn(`${root.title}: last_sync NOT advanced (frozen at ${root.state.last_sync ?? 'never'}) because ${result.errors.length} page(s) failed; they'll be retried next run`);
     }
     root.state.total_pages_downloaded = Object.keys(root.state.pages).length;
     // Collapse the per-page .jsonl into a fresh .json snapshot and delete
@@ -299,17 +287,11 @@ async function runSync(opts: { full: boolean }): Promise<void> {
     headline += `. ${allErrors} error${allErrors === 1 ? '' : 's'} (${errParts}) — re-run \`npm start\` to retry.`;
   }
 
-  log.info(
-    {
-      added: allAdded,
-      updated: allUpdated,
-      deleted: allDeleted,
-      attachments: allAttachments,
-      errors: allErrors,
-      ...(allErrors > 0 ? { errorSummary: allErrorSummary } : {}),
-    },
-    headline,
-  );
+  log.info(headline);
+
+  if (!opts.walkDb) {
+    log.info(`re-run this command after ~1 hour to get newly created pages, or run \`npm start -- --walkdb\` to ignore Confluence's index — this might take a bit longer.`);
+  }
 
   // Throttle stats — "of N HTTP requests, M had to back off." Useful to gauge
   // whether parallel_downloads is set too high for the server.
@@ -319,17 +301,11 @@ async function runSync(opts: { full: boolean }): Promise<void> {
   if (recovered > 0 || failedAfterRetries > 0) {
     const pct = total > 0 ? Math.round((recovered / total) * 100) : 0;
     const failedNote = failedAfterRetries > 0 ? `; ${failedAfterRetries} gave up after the retry budget` : '';
-    log.info(
-      { totalRequests: total, recoveredAfterBackoff: recovered, failedAfterRetries },
-      `throttle: ${recovered} of ${total} requests (${pct}%) had to back off and retry${failedNote}`,
-    );
+    log.info(`throttle: ${recovered} of ${total} requests (${pct}%) had to back off and retry${failedNote}`);
   }
 
   // Adaptive limiter — where did it end up?
-  log.info(
-    { finalConcurrency: adaptiveLimiter.currentCapacity, maxConcurrency: adaptiveLimiter.maxCapacity },
-    `adaptive concurrency settled at ${adaptiveLimiter.currentCapacity} of ${adaptiveLimiter.maxCapacity} max`,
-  );
+  log.info(`adaptive concurrency settled at ${adaptiveLimiter.currentCapacity} of ${adaptiveLimiter.maxCapacity} max`);
 
 }
 
@@ -374,7 +350,7 @@ async function runReconvert(): Promise<void> {
       html = await readFile(htmlAbs, 'utf8');
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-        log.warn({ id, path: htmlPathFor(p.path) }, 'no .html for page; skip (run sync to fetch)');
+        log.warn(`no .html for page ${id} at ${htmlPathFor(p.path)}; skip (run sync to fetch)`);
         skipped++;
         continue;
       }
@@ -405,24 +381,32 @@ async function runReconvert(): Promise<void> {
     await writeFile(mdAbs, body, 'utf8');
     processed++;
   }
-  log.info({ processed, skipped }, 'reconvert complete');
+  log.info(`reconvert complete: ${processed} processed, ${skipped} skipped`);
 }
 
 
 function usage(): void {
-  console.error('usage: npm start -- <sync|refresh|reconvert>');
-  console.error('default (no args): sync — enumerate the full subtree, fetch only pages whose version changed.');
+  console.error('usage: npm start -- <sync|refresh|reconvert> [--walkdb]');
+  console.error('default (no args): sync — enumerate the full subtree via CQL/Lucene, fetch only pages whose version changed.');
+  console.error('--walkdb: bypass Confluence\'s Lucene index and enumerate directly from the DB via /child/page.');
+  console.error('         Slower (one API call per parent page) but sees newly-created pages immediately.');
 }
 
-const [, , cmd] = process.argv;
+const [, , maybeCmd, ...rest] = process.argv;
+// `cmd` is the first non-flag arg; defaults to `sync`. `--walkdb` is a flag,
+// allowed alongside any verb (so `npm start -- --walkdb` and
+// `npm start -- refresh --walkdb` both work).
+const cmd = maybeCmd && !maybeCmd.startsWith('--') ? maybeCmd : 'sync';
+const flags = [maybeCmd, ...rest].filter((a): a is string => typeof a === 'string' && a.startsWith('--'));
+const walkDb = flags.includes('--walkdb');
 
 (async () => {
-  switch (cmd ?? 'sync') {
+  switch (cmd) {
     case 'sync':
-      await runSync({ full: false });
+      await runSync({ full: false, walkDb });
       break;
     case 'refresh':
-      await runSync({ full: true });
+      await runSync({ full: true, walkDb });
       break;
     case 'reconvert':
       await runReconvert();
@@ -437,6 +421,7 @@ const [, , cmd] = process.argv;
       process.exit(1);
   }
 })().catch((err) => {
-  log.error({ err }, 'cli error');
+  const msg = err instanceof Error ? (err.stack ?? err.message) : String(err);
+  log.error(`cli error: ${msg}`);
   process.exitCode = 1;
 });

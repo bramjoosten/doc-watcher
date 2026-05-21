@@ -23,11 +23,17 @@ Edit `config.yaml`:
 npm start
 ```
 
-Incremental sync — the first invocation downloads everything, every later run only fetches what changed since `last_sync`. Resumable on Ctrl+C: just run again to pick up where you stopped. Concurrency self-tunes from Confluence's `X-RateLimit-*` headers, so there's nothing to manually configure beyond the optional `parallel_downloads` ceiling.
+Incremental sync — the first invocation downloads everything, every later run enumerates the subtree via CQL and only fetches pages whose version changed. Resumable on Ctrl+C: just run again to pick up where you stopped. Concurrency self-tunes from Confluence's `X-RateLimit-*` headers, so there's nothing to manually configure beyond the optional `parallel_downloads` ceiling.
+
+**New pages take ~1 hour to show up.** CQL goes through Confluence's Lucene index, which lags page creation (existing-page edits are reflected instantly, since they trigger a per-page reindex). Two ways out: re-run later, or bypass the index entirely with the DB walk:
+
+```sh
+npm start -- --walkdb     # recursive /child/page walk — slower, but sees new pages immediately
+```
 
 ## Other verbs
 
-- `npm start -- refresh` — full re-download (ignores `last_sync`, reconciles deletes)
+- `npm start -- refresh` — full re-download (ignores `last_sync`, reconciles deletes). Accepts `--walkdb`.
 - `npm start -- reconvert` — regenerate every `.md` from the saved `.html` (no network)
 
 See [`CLAUDE.md`](./CLAUDE.md) for the full spec — output layout, file formats, frontmatter shape, adaptive concurrency, limitations.
