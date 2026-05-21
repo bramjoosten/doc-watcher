@@ -56,6 +56,25 @@ export class AdaptiveLimiter {
     return this.max;
   }
 
+  // Skip past slow-start for callers that know the work is metadata-only
+  // (e.g. paging /child/page during the walk phase). Without this, a wide
+  // BFS level fans out N sibling fetches that all queue behind capacity=1
+  // and run effectively serially — for a tree with hundreds of parents
+  // that's tens of minutes of wall time spent on calls that should take
+  // seconds. The first real 429 still halves capacity normally; we're
+  // not disabling backoff, just refusing the cold-cliff floor.
+  warmUp(target: number): void {
+    const prev = this.capacity;
+    this.capacity = Math.min(this.max, Math.max(1, target));
+    if (this.capacity > prev) {
+      log.info(
+        { from: prev, to: this.capacity, max: this.max },
+        `limiter warm-up: capacity ${prev} → ${this.capacity}`,
+      );
+      this.tryWake();
+    }
+  }
+
   async wrap<T>(fn: () => Promise<T>): Promise<T> {
     await this.acquire();
     try {
