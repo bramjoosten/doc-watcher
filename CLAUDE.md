@@ -68,6 +68,7 @@ doc-watcher/
     ├── taskmanager.ts              # entry point: sync / refresh / reconvert
     ├── config.ts                   # zod schema, YAML loader
     ├── confluence.ts               # REST client (typed wrappers around fetch)
+    ├── walker.ts                   # BFS subtree walk via /child/page (DB-backed)
     ├── downloader.ts               # parallel fetch + write, p-limit-bounded
     ├── converter.ts                # storage-format → markdown: cheerio macro pre-pass + in-house walker
     ├── pathing.ts                  # title → slug, rename detection
@@ -103,20 +104,20 @@ docs/
 
 ### Change detection
 
-Confluence Server has no dedicated sync endpoint. We enumerate each configured root via two paginated calls per root, both DB-backed:
+Confluence Server has no dedicated sync endpoint. We enumerate each configured root by walking its subtree level-by-level via Confluence's DB-backed child endpoint:
 
-- `GET /rest/api/content/{rootId}?expand=version,space,ancestors` — the root page itself.
-- `GET /rest/api/content/{rootId}/descendant/page?expand=version,space,ancestors` — every descendant in the subtree.
+- `GET /rest/api/content/{rootId}?expand=version,space,ancestors` — root page itself.
+- `GET /rest/api/content/{parentId}/child/page?expand=version` — direct children of each parent. One call per parent page, recursed level by level. Calls within a BFS level are issued in parallel through the adaptive limiter.
 
-The per-page `version` returned by Confluence is then diffed against the local index: pages with a higher version (or no entry in state) get fetched with `expand=body.storage`; everything else is skipped. New pages, edits, renames, re-parents and deletes all fall out of this single mechanism.
+The walker stitches each child's ancestor chain together locally (`child.ancestors = parent.ancestors + parent`) and inherits `space` from the root, so the per-page response only needs `expand=version`. The per-page `version` is then diffed against the local index: pages with a higher version (or no entry in state) get fetched with `expand=body.storage`; everything else is skipped. New pages, edits, renames, re-parents and deletes all fall out of this single mechanism.
 
-**Why `/descendant/page` and not CQL?** We previously enumerated via `/rest/api/content/search` (CQL: `(id = N OR ancestor = N) AND type = page`). CQL is fast but routes through Confluence's Lucene search index, which can lag the database — and on instances with an unhealthy background indexer, brand-new pages may not appear in the index at all (which also makes them invisible to the in-app search bar). `/descendant/page` walks the persisted parent-ancestor relationship table directly, so newly-created pages show up immediately, regardless of whether the search index has caught up. The cost is similar (~1 request per 100 descendants, no body expansion).
+**Why a recursive `/child/page` walk, not `/descendant/page` or CQL?** Earlier iterations used `/rest/api/content/search` (CQL) — but that endpoint goes through Lucene, which on a real instance lagged page creation by 20+ minutes and made new pages invisible to both CQL and the in-app search bar. We then switched to `/rest/api/content/{id}/descendant/page` — same DB-backed correctness, in one paginated call — but `expand=ancestors` on that endpoint 500'd on real subtrees because Confluence eagerly built the full ancestor chain for every result. The recursive `/child/page` walk avoids both problems: each call is a single parent_id lookup (cheap on the server, no Lucene), and we synthesize ancestors locally so we never ask Confluence to do it. Trade-off: more API calls (~1 per parent page vs. ~1 per 100 descendants total). At realistic single-user scale that's not noticeable, and the adaptive limiter caps concurrency at whatever the server actually wants.
 
-**Deletes.** A page that's been deleted or archived in Confluence disappears from the descendant listing. Anything in the local index but not in the latest enumeration falls into the orphan set; both its `.html` and `.md` are removed from disk and the state entry is dropped.
+**Deletes.** A page that's been deleted or archived in Confluence stops appearing as a child of its former parent. Anything in the local index but not in the latest enumeration falls into the orphan set; both its `.html` and `.md` are removed from disk, the state entry is dropped, and any parent folder that's been left empty is `rmdir`'d (walking up until we hit a non-empty directory or the output root).
 
 ### Confluence REST endpoints used
 
-- `GET /rest/api/content/{id}/descendant/page?expand=version,space,ancestors&limit=100` — every page in the subtree (DB-backed, bypasses Lucene). Paginated.
+- `GET /rest/api/content/{id}/child/page?expand=version&limit=100` — direct children of a page (DB-backed, bypasses Lucene). Called recursively through the subtree by `walker.ts`.
 - `GET /rest/api/content/{id}?expand=body.storage,version,ancestors,space` — full page (storage-format XHTML). Also used to fetch the root page itself.
 - `GET /rest/api/content/{id}/child/attachment?expand=version` — attachment list.
 - `GET /download/attachments/{pageId}/{filename}` — binary download.
@@ -137,7 +138,7 @@ Always deterministic, always replayable. The `.html` file on disk is what the co
 
 Verbs:
 
-- **`sync`** (default): enumerate the full subtree via `/rest/api/content/{rootId}/descendant/page` plus a direct fetch of the root (`expand=version,space,ancestors`, no body), diff each page's version against state, fetch any new-or-changed pages in parallel, write both `.html` and `.md`, atomic state-file replace at the end.
+- **`sync`** (default): recursively walk the subtree via `/rest/api/content/{id}/child/page` (one call per parent, BFS, gated by the adaptive limiter), diff each page's version against state, fetch any new-or-changed pages in parallel with `expand=body.storage,version,ancestors,space`, write both `.html` and `.md`, atomic state-file replace at the end.
 - **`refresh`**: same as `sync` but ignores `last_sync` (full re-download).
 - **`reconvert`**: walk every `.html` already on disk and regenerate the `.md` next to it. No network calls. Used after a converter change.
 

@@ -248,30 +248,22 @@ export class ConfluenceClient {
     return this.request<ConfluencePage>(path, undefined, opts);
   }
 
-  // Enumerate every descendant of a page via Confluence's DB-backed
-  // ancestor-relationship endpoint. Unlike `/rest/api/content/search`
-  // (which uses the Lucene index and may not see pages that haven't
-  // been indexed yet), this hits the content table directly — so
-  // newly-created pages show up immediately, regardless of whether
-  // the background indexer has caught up.
-  async getDescendantPages(pageId: string, expand: string[] = ['version']): Promise<ConfluencePage[]> {
+  // Direct children of a page via Confluence's DB-backed child endpoint.
+  // Like /descendant/page this bypasses Lucene, but it's a single
+  // parent_id lookup against the content table — much lighter than
+  // /descendant/page's ancestor-table join, and importantly doesn't
+  // need `expand=ancestors` (which 500'd on /descendant/page for large
+  // subtrees because Confluence built the full chain per result).
+  // Callers do the recursion + ancestor bookkeeping themselves.
+  async getChildPages(parentId: string, expand: string[] = ['version']): Promise<ConfluencePage[]> {
     const params = new URLSearchParams();
     params.set('limit', '100');
     if (expand.length) params.set('expand', expand.join(','));
-    const path = `/rest/api/content/${encodeURIComponent(pageId)}/descendant/page?${params.toString()}`;
+    const path = `/rest/api/content/${encodeURIComponent(parentId)}/child/page?${params.toString()}`;
     const out: ConfluencePage[] = [];
-    log.info({ pageId }, 'enumerating descendants via /descendant/page (DB-backed, bypasses Lucene)');
-    const started = Date.now();
     for await (const item of this.paginate<ConfluencePage>(path)) {
       out.push(item);
-      if (out.length % 100 === 0) {
-        log.info({ pagesListed: out.length, elapsedMs: Date.now() - started }, `${out.length} descendants listed so far`);
-      }
     }
-    log.info(
-      { pageId, total: out.length, elapsedMs: Date.now() - started },
-      `Confluence returned ${out.length} descendants in ${Date.now() - started}ms`,
-    );
     return out;
   }
 

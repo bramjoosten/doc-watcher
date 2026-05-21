@@ -1,4 +1,5 @@
-import { posix } from 'node:path';
+import { posix, dirname, resolve, sep } from 'node:path';
+import { readdir, rmdir } from 'node:fs/promises';
 
 export function asciiFold(input: string): string {
   return input.normalize('NFKD').replace(/[̀-ͯ]/g, '');
@@ -51,4 +52,30 @@ export function attachmentRelativeForPage(pageRelPath: string, spaceKey: string,
   const pageDir = posix.dirname(pageRelPath);
   const target = attachmentPath(spaceKey, pageId, filename);
   return posix.relative(pageDir, target) || filename;
+}
+
+// Walk up from the directory containing `removedFilePath` and rmdir each
+// directory that has become empty, stopping at the first non-empty one or
+// when we reach `stopAt` (the configured output dir). Used after deleting
+// a page's `.md`/`.html` so that a now-empty `<slug>--<id>/` parent folder
+// doesn't get left behind, and so chains of nested empty parents collapse
+// cleanly when a whole subtree disappears from Confluence.
+export async function pruneEmptyParents(removedFilePath: string, stopAt: string): Promise<void> {
+  const stop = resolve(stopAt);
+  let dir = resolve(dirname(removedFilePath));
+  while (dir !== stop && dir.startsWith(stop + sep)) {
+    let entries: string[];
+    try {
+      entries = await readdir(dir);
+    } catch {
+      break;
+    }
+    if (entries.length > 0) break;
+    try {
+      await rmdir(dir);
+    } catch {
+      break;
+    }
+    dir = dirname(dir);
+  }
 }

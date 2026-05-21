@@ -17,7 +17,8 @@ import {
   titleIndexKey,
 } from './downloader.js';
 import { log } from './log.js';
-import { htmlPathFor } from './pathing.js';
+import { htmlPathFor, pruneEmptyParents } from './pathing.js';
+import { enumerateSubtree } from './walker.js';
 import {
   appendIndexEntry,
   buildTree,
@@ -160,21 +161,13 @@ async function runSync(opts: { full: boolean }): Promise<void> {
   for (const root of roots) {
     log.info({ rootId: root.rootId, title: root.title }, `syncing root "${root.title}" (${root.rootId})`);
 
-    // Enumerate via /descendant/page (DB-backed) plus a direct fetch of the
-    // root itself. We deliberately avoid /rest/api/content/search (CQL) here:
-    // that endpoint goes through Lucene and silently skips pages the search
-    // index hasn't indexed yet — including freshly-created ones on instances
-    // where the background indexer is behind or unhealthy.
-    const [rootPage, descendants] = await Promise.all([
-      client.getPage(root.rootId, ['version', 'space', 'ancestors']),
-      client.getDescendantPages(root.rootId, ['version', 'space', 'ancestors']),
-    ]);
-    const results = [rootPage, ...descendants];
+    // Recursive walk via /child/page (DB-backed, bypasses Lucene). The walker
+    // synthesises each page's ancestor chain locally from its parent's chain,
+    // so we never need `expand=ancestors` — which 500'd on /descendant/page
+    // because Confluence eagerly built the full chain for every descendant.
+    const { pages: results, pagesWithChildren } = await enumerateSubtree(root.rootId, client, adaptiveLimiter);
     const seen = new Map<string, (typeof results)[number]>();
     for (const r of results) seen.set(r.id, r);
-
-    const pagesWithChildren = new Set<string>();
-    for (const page of seen.values()) for (const a of page.ancestors ?? []) pagesWithChildren.add(a.id);
 
     for (const page of seen.values()) {
       knownPagePaths.set(page.id, pickPageRelPath(page, pagesWithChildren, rootPageIds));
@@ -231,6 +224,11 @@ async function runSync(opts: { full: boolean }): Promise<void> {
       try {
         await rm(mdAbs, { force: true });
         await rm(htmlAbs, { force: true });
+        // Collapse any now-empty parent folders. If this page was a parent
+        // (`<slug>--<id>/_index.md`) and its children were also deleted in
+        // this sync, the whole branch collapses cleanly instead of leaving
+        // a chain of empty directories.
+        await pruneEmptyParents(mdAbs, outputDir);
         log.info({ rootId: root.rootId, id, path: st.path, title: st.title }, `removed deleted/archived page: ${st.title} (${id})`);
       } catch (err) {
         log.warn({ rootId: root.rootId, err, id }, 'orphan delete failed');
