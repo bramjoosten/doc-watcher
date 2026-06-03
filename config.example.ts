@@ -6,7 +6,7 @@ export default {
   // Confluence PAT. Create at: <confluence>/plugins/personalaccesstokens/usertokens.action
   pat: '',
 
-  // Where mirrored docs go (per-root index JSONs live here too).
+  // Where to store the downloaded docs. By default, next to this project.
   output_dir: '../docs',
 
   // Confluence page or space URLs to mirror — paste from your browser.
