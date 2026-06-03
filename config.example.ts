@@ -22,14 +22,18 @@ export default {
   output_dir: '../docs',
 
   // Confluence page or space URL(s) whose subtree(s) to mirror. Paste the
-  // URL from your browser address bar — any of these shapes work:
-  //   /pages/viewpage.action?pageId=12345      (id form, no lookup needed)
-  //   /spaces/<KEY>/pages/12345/Title          (newer DC style)
-  //   /spaces/<KEY>/overview                    (newer-UI space homepage)
-  //   /spaces/<KEY>                             (newer-UI space homepage, bare)
-  //   /display/<KEY>/Page+Title                (pretty form — one lookup)
-  //   /display/<KEY>                            (space homepage)
-  //   /spaces/viewspace.action?key=<KEY>        (space homepage, action form)
+  // URL from your browser address bar — any of these shapes work, with or
+  // without the Cloud `/wiki/` prefix and with or without a trailing slash:
+  //   any ?pageId=12345 query (viewpage / editpage / copypage / draft / ...)
+  //   /spaces/<KEY>/pages/12345/Slug             (newer permalink, with or w/o slug)
+  //   /pages/12345                                (flat permalink, some DC builds)
+  //   /display/<KEY>/Page+Title                  (pretty page — one lookup)
+  //   /display/<KEY>                              (space homepage — one lookup)
+  //   /spaces/<KEY>                               (space homepage, newer UI)
+  //   /spaces/<KEY>/overview                      (space homepage, explicit)
+  //   /spaces/<KEY>/pages                         (page-tree → space homepage)
+  //   /spaces/viewspace.action?key=<KEY>          (space homepage, legacy action)
+  //   /x/<token>                                  (Share-menu short link, one redirect)
   // The Confluence base URL is derived from the first URL's origin, so
   // there's no separate base_url to keep in sync. All roots must share an
   // origin (one Confluence per run). If you list a root that's nested

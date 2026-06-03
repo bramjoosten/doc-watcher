@@ -14,58 +14,105 @@ export interface ResolvedRoot {
 }
 
 // Classify a Confluence URL into one of the shapes we understand, returning
-// either an immediate page id or a "resolve this later" descriptor. Network
-// only fires for the descriptor cases (display-with-title, space-homepage).
+// either an immediate page id, a "resolve this later" descriptor, or — for
+// short links — a "follow the redirect and re-classify" descriptor. The
+// network only fires for descriptors, not for URLs that already carry an id.
 type Classification =
   | { kind: 'id'; pageId: string }
   | { kind: 'display-page'; spaceKey: string; title: string }
-  | { kind: 'space-home'; spaceKey: string };
+  | { kind: 'space-home'; spaceKey: string }
+  | { kind: 'short-link' };
+
+// Pathname normalisation that runs before every regex match:
+//   • Strip the /wiki prefix that Confluence Cloud puts on every URL.
+//   • Strip a single trailing slash so /spaces/ENG and /spaces/ENG/ match the
+//     same regex without each pattern having to repeat `/?` itself.
+function normalisePath(pathname: string): string {
+  const noWiki = pathname.replace(/^\/wiki(?=\/)/, '');
+  if (noWiki.length > 1 && noWiki.endsWith('/')) return noWiki.slice(0, -1);
+  return noWiki;
+}
 
 function classify(url: URL): Classification | null {
+  const path = normalisePath(url.pathname);
   const params = url.searchParams;
 
-  // /pages/viewpage.action?pageId=12345
-  if (url.pathname.endsWith('/pages/viewpage.action')) {
-    const id = params.get('pageId');
-    if (id && /^\d+$/.test(id)) return { kind: 'id', pageId: id };
-    return null;
+  // Any URL carrying a numeric ?pageId= resolves directly. Catches every
+  // action endpoint that operates on a single page: viewpage, editpage,
+  // copypage, movepage, deletepage, resumedraft, and friends. The exact
+  // path doesn't matter — if there's a pageId, that's the page.
+  const pageIdParam = params.get('pageId');
+  if (pageIdParam && /^\d+$/.test(pageIdParam)) {
+    return { kind: 'id', pageId: pageIdParam };
   }
 
-  // /spaces/<SPACE>/pages/<id>/<slug-or-title> — newer Confluence URL style.
-  // Path id wins; we never need the slug.
-  const spacesPagesMatch = /^\/spaces\/([^/]+)\/pages\/(\d+)(?:\/|$)/.exec(url.pathname);
+  // Short links — /x/<token> with no query. These are 302 redirects to a
+  // canonical page URL; we follow them once, then re-classify the target.
+  if (/^\/x\/[A-Za-z0-9_-]+$/.test(path)) {
+    return { kind: 'short-link' };
+  }
+
+  // /spaces/<SPACE>/pages/<id>[/<slug-or-title>] — the newer "permalink"
+  // page URL. Path id wins; we never need the slug.
+  const spacesPagesMatch = /^\/spaces\/([^/]+)\/pages\/(\d+)(?:\/|$)/.exec(path);
   if (spacesPagesMatch) return { kind: 'id', pageId: spacesPagesMatch[2]! };
 
-  // /spaces/viewspace.action?key=<SPACE> — space homepage, no page id.
-  if (url.pathname.endsWith('/spaces/viewspace.action')) {
+  // /pages/<id> — some Confluence builds expose a flat page-by-id permalink
+  // without a space wrapper. Same handling: id wins, ignore anything after.
+  const flatPagesMatch = /^\/pages\/(\d+)(?:\/|$)/.exec(path);
+  if (flatPagesMatch) return { kind: 'id', pageId: flatPagesMatch[1]! };
+
+  // /spaces/viewspace.action?key=<SPACE> — legacy action-form space home.
+  if (path.endsWith('/spaces/viewspace.action')) {
     const key = params.get('key');
     if (key) return { kind: 'space-home', spaceKey: key };
     return null;
   }
 
-  // /spaces/<SPACE>/overview or /spaces/<SPACE>(/) — newer-UI space-home form.
-  // Must come after the /spaces/<key>/pages and /spaces/viewspace.action
-  // checks because [^/]+ would otherwise swallow those.
-  const spacesHomeMatch = /^\/spaces\/([^/]+)(?:\/overview)?\/?$/.exec(url.pathname);
+  // Newer-UI space-home shapes:
+  //   /spaces/<KEY>            — bare space root
+  //   /spaces/<KEY>/overview   — explicit overview link
+  //   /spaces/<KEY>/pages      — the page-tree view (treated as space home)
+  // Must come after the /spaces/<key>/pages/<id> and viewspace.action
+  // checks, since [^/]+ would otherwise swallow those keys.
+  const spacesHomeMatch = /^\/spaces\/([^/]+)(?:\/(?:overview|pages))?$/.exec(path);
   if (spacesHomeMatch) {
-    const key = decodeURIComponent(spacesHomeMatch[1]!);
-    return { kind: 'space-home', spaceKey: key };
+    return { kind: 'space-home', spaceKey: decodeURIComponent(spacesHomeMatch[1]!) };
   }
 
-  // /display/<SPACE>/<Title+With+Pluses> — pretty form. No id in URL; resolve by title.
-  // /display/<SPACE> on its own is the space homepage.
-  const displayMatch = /^\/display\/([^/]+)(?:\/(.+))?$/.exec(url.pathname);
+  // Legacy pretty form. /display/<KEY>/<Title> resolves by title; bare
+  // /display/<KEY> is a space homepage. Title is `+`-encoded for spaces;
+  // pathname doesn't decode that, so we do it manually.
+  const displayMatch = /^\/display\/([^/]+)(?:\/(.+))?$/.exec(path);
   if (displayMatch) {
     const spaceKey = decodeURIComponent(displayMatch[1]!);
     const titleRaw = displayMatch[2];
     if (!titleRaw) return { kind: 'space-home', spaceKey };
-    // Confluence encodes spaces in titles as `+`. URLSearchParams handles that;
-    // pathname doesn't, so decode manually.
     const title = decodeURIComponent(titleRaw.replace(/\+/g, ' '));
     return { kind: 'display-page', spaceKey, title };
   }
 
   return null;
+}
+
+// Follow a /x/<token> short link by issuing a HEAD with manual redirect
+// handling and reading the Location header. Recurses once with the
+// destination so a target like /pages/viewpage.action?pageId=... or
+// /display/<KEY>/<Title> gets classified normally. We cap follows at 3 to
+// stop pathological short-link chains from looping the resolver.
+async function followShortLink(href: string, depth: number): Promise<string> {
+  if (depth > 3) {
+    throw new Error(`short link ${href} kept redirecting (>3 hops) — paste the canonical URL instead`);
+  }
+  const res = await fetch(href, { method: 'HEAD', redirect: 'manual' });
+  const location = res.headers.get('location');
+  if (!location) {
+    throw new Error(`short link ${href} did not redirect (status ${res.status}) — paste the canonical URL instead`);
+  }
+  // Confluence returns absolute URLs in Location for short links, but
+  // tolerate the relative form too just in case.
+  const target = location.startsWith('http') ? location : new URL(location, href).href;
+  return target;
 }
 
 export async function resolveRoots(
@@ -96,27 +143,34 @@ export async function resolveRoots(
   const baseUrl = parsed[0]!.url.origin;
 
   // Classify + resolve. Sequential because each step might hit the network
-  // (display-page and space-home need one API call) and the cost is one
-  // request per root, total — not worth parallelising for the rare case of
-  // dozens of roots.
+  // (display-page, space-home, short-link) and the cost is one request per
+  // root, total — not worth parallelising for the rare case of dozens of
+  // roots, and sequential keeps error messages tied to the right URL.
   const roots: ResolvedRoot[] = [];
-  for (const { href, url } of parsed) {
-    const classified = classify(url);
-    if (!classified) {
-      throw new Error(
-        `unrecognised Confluence URL shape: ${href}. Expected /pages/viewpage.action?pageId=, /spaces/<key>/pages/<id>/, /spaces/<key>/overview, /spaces/<key>, /display/<space>/<title>, /display/<space>, or /spaces/viewspace.action?key=<space>`,
-      );
-    }
-    let pageId: string;
-    if (classified.kind === 'id') {
-      pageId = classified.pageId;
-    } else if (classified.kind === 'display-page') {
-      pageId = await client.findPageIdByTitle(classified.spaceKey, classified.title);
-    } else {
-      pageId = await client.getSpaceHomepageId(classified.spaceKey);
-    }
+  for (const { href } of parsed) {
+    const pageId = await resolveOne(href, client, 0);
     roots.push({ origin: baseUrl, pageId, sourceUrl: href });
   }
 
   return { baseUrl, roots };
+}
+
+async function resolveOne(href: string, client: ConfluenceClient, depth: number): Promise<string> {
+  const url = new URL(href);
+  const classified = classify(url);
+  if (!classified) {
+    throw new Error(
+      `unrecognised Confluence URL shape: ${href}. Supported: /pages/viewpage.action?pageId=, /spaces/<KEY>/pages/<id>/, /pages/<id>, /spaces/<KEY>/overview, /spaces/<KEY>, /spaces/<KEY>/pages, /display/<KEY>/<Title>, /display/<KEY>, /spaces/viewspace.action?key=<KEY>, /x/<token>. The /wiki prefix (Confluence Cloud) is auto-stripped.`,
+    );
+  }
+  if (classified.kind === 'id') return classified.pageId;
+  if (classified.kind === 'display-page') {
+    return client.findPageIdByTitle(classified.spaceKey, classified.title);
+  }
+  if (classified.kind === 'space-home') {
+    return client.getSpaceHomepageId(classified.spaceKey);
+  }
+  // short-link → follow + recurse
+  const target = await followShortLink(href, depth);
+  return resolveOne(target, client, depth + 1);
 }
