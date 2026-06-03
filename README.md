@@ -25,7 +25,9 @@ Edit `config.ts`:
 npm start
 ```
 
-Incremental sync. For a known root every later run uses a `lastmodified >= last_sync` CQL filter, so it's typically one request that returns only the pages edited since last run — sub-second on a normal day. A brand-new root (first appearance in `roots`, or after `--reset`) is downloaded via the DB walk path automatically, so it works on first run with no flags. Resumable on Ctrl+C: just run again to pick up where you stopped. Concurrency self-tunes from Confluence's `X-RateLimit-*` headers — there's no knob to turn.
+Incremental sync. The first invocation paginates the whole subtree via CQL and downloads everything. Every later run uses a `lastmodified >= last_sync` filter, so it's typically one request that returns only the pages edited since last run — sub-second on a normal day. Resumable on Ctrl+C: just run again to pick up where you stopped. Concurrency self-tunes from Confluence's `X-RateLimit-*` headers — there's no knob to turn.
+
+**Heads-up for brand-new roots.** CQL goes through Confluence's Lucene index, which may not have materialised descendant relationships for a freshly-watched root yet — on a first run that returns ≤1 page, doc-watcher prints a hint pointing at `--includeNew` so you can opt into the DB walk explicitly. It never falls back silently.
 
 **Page comments are folded into the `.md`.** Every sync pulls the comments under each root via a single CQL call, threads them, and appends a `## Comments` section to the page they belong to. Inline-anchored comments emit an inline footnote (`[c<n>]`) at their marker position; the Comments section quotes the anchored text so a reader has context. Footer comments follow as a threaded discussion. A page is re-rendered when either its body or its comment set changes.
 

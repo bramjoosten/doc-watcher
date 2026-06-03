@@ -134,7 +134,6 @@ async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<v
   }
 
   const adaptiveLimiter = new AdaptiveLimiter({ max: MAX_PARALLEL_DOWNLOADS, slowStart: true });
-  log.info(`adaptive concurrency: starting at ${adaptiveLimiter.currentCapacity}, ramping toward ${MAX_PARALLEL_DOWNLOADS} on sustained success`);
 
   // Resolve user-pasted URLs to {baseUrl, rootIds}. URLs that already carry
   // a pageId resolve without a network call; pretty /display/SPACE/Title
@@ -192,17 +191,12 @@ async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<v
   const allErrorSummary: Record<string, number> = {};
 
   for (const root of roots) {
-    // For a brand-new root (no prior last_sync) the DB walk is the right
-    // default even without --includeNew: CQL depends on Confluence's Lucene
-    // index, which often hasn't materialised descendant relationships for a
-    // newly-watched root yet, leading to silent zero-result enumerations.
-    // The DB walk hits the content table directly and bypasses Lucene.
-    const useDbWalk = opts.includeNew || !root.state.last_sync;
+    const useDbWalk = opts.includeNew;
     const mode = opts.includeNew
       ? 'DB walk (slow, catches edits + creations + deletions)'
-      : !root.state.last_sync
-        ? 'DB walk (first run for this root — Lucene lag would risk a silent zero-result)'
-        : `CQL incremental, lastmodified >= ${root.state.last_sync} (instant, edits only)`;
+      : root.state.last_sync
+        ? `CQL incremental, lastmodified >= ${root.state.last_sync} (instant, edits only)`
+        : 'CQL full enumeration (first run / after --reset)';
     log.info(`syncing root "${root.title}" (${root.rootId}) via ${mode}`);
 
     const { pages: results, pagesWithChildren } = useDbWalk
@@ -210,6 +204,16 @@ async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<v
       : await enumerateViaCQL(root.rootId, client, root.state.last_sync);
     const seen = new Map<string, (typeof results)[number]>();
     for (const r of results) seen.set(r.id, r);
+
+    // Soft safety net: on a first run, CQL goes through Lucene and can
+    // return zero (or near-zero) results if the indexer hasn't materialised
+    // descendant relationships for this root yet. Don't fall back silently
+    // — emit a hint pointing at --includeNew so the user can opt in to the
+    // DB walk explicitly. Triggers when last_sync was null and we got ≤1
+    // page back (just the root itself or nothing).
+    if (!opts.includeNew && !root.state.last_sync && seen.size <= 1) {
+      log.warn(`${root.title}: first-run CQL returned ${seen.size} page(s). If you expected more, Confluence's Lucene index may not have built descendant relationships for this root yet — try \`npm start -- --includeNew\` to walk the subtree directly via the DB.`);
+    }
 
     // Comments for the subtree, fetched once per root via CQL. The list is
     // grouped by container.id so the downloader can render each page's
@@ -252,7 +256,7 @@ async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<v
     // enumeration. On a filtered incremental we'd be writing "changed
     // since last_sync" into a field that means "total in subtree" —
     // confusing. Leave the previous value in place on incremental runs.
-    if (useDbWalk || opts.reset) {
+    if (useDbWalk || !root.state.last_sync || opts.reset) {
       root.state.total_watched_pages_on_remote = seen.size;
     }
     root.state.total_pages_downloaded = Object.keys(root.state.pages).length;
@@ -288,10 +292,11 @@ async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<v
     );
 
     // Delete reconciliation only runs when we've seen the full subtree —
-    // i.e. DB walk (the new default for first-run roots) or --includeNew.
-    // On a filtered incremental CQL run we can't tell missing-from-result
-    // from never-edited, so we skip it and let the next sweep catch deletes.
-    const sawFullSubtree = useDbWalk || opts.reset;
+    // i.e. --includeNew (DB walk) or a CQL run without the lastmodified
+    // filter (first run / after --reset). On a filtered incremental CQL
+    // we can't tell missing-from-result from never-edited, so we skip it
+    // and let the next --includeNew sweep catch any deletes.
+    const sawFullSubtree = useDbWalk || !root.state.last_sync || opts.reset;
     let deletedCount = 0;
     if (sawFullSubtree) {
       const allIds = new Set(seen.keys());
@@ -397,9 +402,6 @@ async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<v
     const failedNote = failedAfterRetries > 0 ? `; ${failedAfterRetries} gave up after the retry budget` : '';
     log.info(`throttle: ${recovered} of ${total} requests (${pct}%) had to back off and retry${failedNote}`);
   }
-
-  // Adaptive limiter — where did it end up?
-  log.info(`adaptive concurrency settled at ${adaptiveLimiter.currentCapacity} of ${adaptiveLimiter.maxCapacity} max`);
 
 }
 
