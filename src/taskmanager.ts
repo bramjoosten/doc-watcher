@@ -7,17 +7,20 @@ import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { AdaptiveLimiter } from './adaptive-limiter.ts';
 import { loadConfig } from './config.ts';
-import { ConfluenceClient } from './confluence.ts';
+import { ConfluenceClient, type ConfluencePage } from './confluence.ts';
 import { convertStorageFormat } from './converter.ts';
 import {
+  buildCommentsSection,
   buildConvertOptions,
   buildMarkdownBody,
+  commentsChanged,
   downloadPages,
   pickPageRelPath,
   titleIndexKey,
 } from './downloader.ts';
 import { log } from './log.ts';
 import { htmlPathFor, pruneEmptyParents } from './pathing.ts';
+import { resolveRoots } from './url-resolver.ts';
 import { enumerateSubtree, enumerateViaCQL } from './walker.ts';
 import {
   appendIndexEntry,
@@ -82,6 +85,39 @@ async function resolveRoot(
   };
 }
 
+// Drop any root whose ancestor chain contains another configured root id —
+// that's a nested-root configuration, and the parent root already covers
+// everything the child would. We do this AFTER URL resolution so the warning
+// shows the URL the user actually pasted, not just an opaque id.
+async function dropNestedRoots(
+  rootIds: string[],
+  rootUrls: Map<string, string>,
+  client: ConfluenceClient,
+): Promise<string[]> {
+  if (rootIds.length < 2) return rootIds;
+  const idSet = new Set(rootIds);
+  const ancestorsFor = new Map<string, Set<string>>();
+  await Promise.all(
+    rootIds.map(async (id) => {
+      const page = await client.getPage(id, ['ancestors']);
+      ancestorsFor.set(id, new Set((page.ancestors ?? []).map((a) => a.id)));
+    }),
+  );
+  const kept: string[] = [];
+  for (const id of rootIds) {
+    const ancestors = ancestorsFor.get(id)!;
+    const nestedUnder = [...idSet].find((other) => other !== id && ancestors.has(other));
+    if (nestedUnder) {
+      log.warn(
+        `dropping nested root ${rootUrls.get(id) ?? id}: it lives under ${rootUrls.get(nestedUnder) ?? nestedUnder}, which already covers it`,
+      );
+      continue;
+    }
+    kept.push(id);
+  }
+  return kept;
+}
+
 async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<void> {
   const { config, rootDir } = await loadConfig();
   const outputDir = resolve(rootDir, config.output_dir);
@@ -100,15 +136,26 @@ async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<v
   const adaptiveLimiter = new AdaptiveLimiter({ max: MAX_PARALLEL_DOWNLOADS, slowStart: true });
   log.info(`adaptive concurrency: starting at ${adaptiveLimiter.currentCapacity}, ramping toward ${MAX_PARALLEL_DOWNLOADS} on sustained success`);
 
+  // Resolve user-pasted URLs to {baseUrl, rootIds}. URLs that already carry
+  // a pageId resolve without a network call; pretty /display/SPACE/Title
+  // URLs cost one search request each.
+  const preClient = new ConfluenceClient({ baseUrl: new URL(config.roots[0]!).origin, pat: config.pat });
+  const { baseUrl, roots: resolvedRoots } = await resolveRoots(config.roots, preClient);
+
   const client = new ConfluenceClient({
-    baseUrl: config.base_url,
+    baseUrl,
     pat: config.pat,
     rateLimitObserver: adaptiveLimiter,
   });
 
-  // Load (or initialise) one index per configured root.
+  // Detect and drop nested roots before we waste any work on them.
+  const rootUrlById = new Map<string, string>();
+  for (const r of resolvedRoots) rootUrlById.set(r.pageId, r.sourceUrl);
+  const liveRootIds = await dropNestedRoots(resolvedRoots.map((r) => r.pageId), rootUrlById, client);
+
+  // Load (or initialise) one index per live root.
   const roots: RootContext[] = [];
-  for (const rootId of config.root_page_ids) {
+  for (const rootId of liveRootIds) {
     roots.push(await resolveRoot(outputDir, rootId, client, opts.reset));
   }
   const totalLocal = roots.reduce((acc, r) => acc + Object.keys(r.state.pages).length, 0);
@@ -117,9 +164,9 @@ async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<v
     .join('; ');
   log.info(`loaded ${roots.length} root index file(s) — ${totalLocal} pages already on disk: ${rootSummary}`);
 
-  // Configured root ids — used by pickPageRelPath to trim ancestor folders
-  // above the root so the on-disk tree starts where the user said to.
-  const rootPageIds = new Set(config.root_page_ids);
+  // Live root ids — used by pickPageRelPath to trim ancestor folders above
+  // the root so the on-disk tree starts where the user said to.
+  const rootPageIds = new Set(liveRootIds);
 
   // Maps shared across all roots so cross-root ac:link references resolve
   // to a local path. Seed from existing state on every root, then per-root
@@ -145,26 +192,38 @@ async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<v
   const allErrorSummary: Record<string, number> = {};
 
   for (const root of roots) {
+    // For a brand-new root (no prior last_sync) the DB walk is the right
+    // default even without --includeNew: CQL depends on Confluence's Lucene
+    // index, which often hasn't materialised descendant relationships for a
+    // newly-watched root yet, leading to silent zero-result enumerations.
+    // The DB walk hits the content table directly and bypasses Lucene.
+    const useDbWalk = opts.includeNew || !root.state.last_sync;
     const mode = opts.includeNew
       ? 'DB walk (slow, catches edits + creations + deletions)'
-      : root.state.last_sync
-        ? `CQL incremental, lastmodified >= ${root.state.last_sync} (instant, edits only)`
-        : 'CQL full enumeration (first run / after --reset)';
+      : !root.state.last_sync
+        ? 'DB walk (first run for this root — Lucene lag would risk a silent zero-result)'
+        : `CQL incremental, lastmodified >= ${root.state.last_sync} (instant, edits only)`;
     log.info(`syncing root "${root.title}" (${root.rootId}) via ${mode}`);
 
-    // Two enumeration strategies:
-    //   • Default (CQL): if state.last_sync is set, append a `lastmodified >=`
-    //     filter to the CQL — typically returns just the few pages edited
-    //     since last run, in one request. On first run / after --reset the
-    //     filter is omitted and we paginate the whole subtree.
-    //   • --includeNew: recursive /child/page walk via the DB-backed
-    //     endpoint. Slower but the only path that picks up brand-new pages
-    //     (Lucene lags creation by ~1h) and reconciles deletes.
-    const { pages: results, pagesWithChildren } = opts.includeNew
+    const { pages: results, pagesWithChildren } = useDbWalk
       ? await enumerateSubtree(root.rootId, client, adaptiveLimiter)
       : await enumerateViaCQL(root.rootId, client, root.state.last_sync);
     const seen = new Map<string, (typeof results)[number]>();
     for (const r of results) seen.set(r.id, r);
+
+    // Comments for the subtree, fetched once per root via CQL. The list is
+    // grouped by container.id so the downloader can render each page's
+    // comments inline and the diff loop below can spot comment-only changes.
+    const commentList = await client.searchCommentsBySubtree(root.rootId);
+    const commentsByPageId = new Map<string, ConfluencePage[]>();
+    for (const c of commentList) {
+      const pid = c.container?.id;
+      if (!pid) continue;
+      const arr = commentsByPageId.get(pid) ?? [];
+      arr.push(c);
+      commentsByPageId.set(pid, arr);
+    }
+    log.info(`${root.title}: ${commentList.length} comment(s) across ${commentsByPageId.size} page(s)`);
 
     for (const page of seen.values()) {
       knownPagePaths.set(page.id, pickPageRelPath(page, pagesWithChildren, rootPageIds));
@@ -172,9 +231,19 @@ async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<v
       if (sp) titleIndex.set(titleIndexKey(sp, page.title), page.id);
     }
 
+    // Pages needing a re-render = body version bumped OR new to us OR comment
+    // set changed. Comment-only changes still trigger a full page re-fetch
+    // because the body comes back free with `expand=body.storage`, and writing
+    // a fresh .md with the same body + new Comments section is the simplest
+    // path. On an incremental CQL run we don't see unchanged pages at all, so
+    // comment-only changes there are picked up on the next --includeNew sweep
+    // or full sync.
     const remaining = [...seen.values()].filter((p) => {
       const prev = root.state.pages[p.id];
-      return !prev || prev.version !== (p.version?.number ?? 0);
+      if (!prev) return true;
+      if (prev.version !== (p.version?.number ?? 0)) return true;
+      const observedComments = commentsByPageId.get(p.id) ?? [];
+      return commentsChanged(prev.comments ?? {}, observedComments);
     });
     const newPageIds = new Set(remaining.filter((p) => !root.state.pages[p.id]).map((p) => p.id));
     const updatedPageIds = new Set(remaining.filter((p) => root.state.pages[p.id]).map((p) => p.id));
@@ -183,7 +252,7 @@ async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<v
     // enumeration. On a filtered incremental we'd be writing "changed
     // since last_sync" into a field that means "total in subtree" —
     // confusing. Leave the previous value in place on incremental runs.
-    if (opts.includeNew || !root.state.last_sync || opts.reset) {
+    if (useDbWalk || opts.reset) {
       root.state.total_watched_pages_on_remote = seen.size;
     }
     root.state.total_pages_downloaded = Object.keys(root.state.pages).length;
@@ -198,6 +267,7 @@ async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<v
       remaining,
       {
         config,
+        baseUrl,
         client,
         outputDir,
         state: root.state,
@@ -207,6 +277,7 @@ async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<v
         rootPageIds,
         limiter: adaptiveLimiter,
         logPerPage,
+        commentsByPageId,
         // Cheap per-page persistence: append one line to the sibling .jsonl
         // instead of re-serialising the whole .json. The .json is rewritten
         // (and the .jsonl deleted) at finalizeIndex below.
@@ -217,11 +288,10 @@ async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<v
     );
 
     // Delete reconciliation only runs when we've seen the full subtree —
-    // i.e. `--includeNew` (DB walk) or a CQL run without the lastmodified
-    // filter (first run / after `--reset`). On a filtered incremental
-    // CQL we can't tell missing-from-result from never-edited, so we
-    // skip it and let the next --includeNew sweep catch any deletes.
-    const sawFullSubtree = opts.includeNew || !root.state.last_sync || opts.reset;
+    // i.e. DB walk (the new default for first-run roots) or --includeNew.
+    // On a filtered incremental CQL run we can't tell missing-from-result
+    // from never-edited, so we skip it and let the next sweep catch deletes.
+    const sawFullSubtree = useDbWalk || opts.reset;
     let deletedCount = 0;
     if (sawFullSubtree) {
       const allIds = new Set(seen.keys());
@@ -337,17 +407,31 @@ async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<v
 async function runReconvert(): Promise<void> {
   const { config, rootDir } = await loadConfig();
   const outputDir = resolve(rootDir, config.output_dir);
+  const baseUrl = new URL(config.roots[0]!).origin;
 
   // Load every per-root index, merging into one big map for the resolver.
   // We don't need a client here — reconvert is network-free, working entirely
   // from the saved .html files on disk plus the resolver maps in state.
+  // Discovery is by glob: every `index-*--<id>.json` next to outputDir gets
+  // picked up regardless of which roots are currently in config, so a
+  // reconvert after a root removal still rebuilds the on-disk corpus.
   const mergedPages: StateFile['pages'] = {};
   const mergedKnown = new Map<string, string>();
   const mergedTitle = new Map<string, string>();
-  for (const rootId of config.root_page_ids) {
-    const existing = await findExistingIndexFile(outputDir, rootId);
-    if (!existing) continue;
-    const state = await readIndex(existing, rootId, '(unknown)');
+  const { readdir } = await import('node:fs/promises');
+  let entries: string[] = [];
+  try {
+    entries = await readdir(outputDir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  }
+  const indexFiles = entries.filter((e) => e.startsWith('index-') && e.endsWith('.json'));
+  for (const f of indexFiles) {
+    // Extract id from the `--<id>.json` suffix to drive readIndex's rootId
+    // default; the file's stored root_page_id wins anyway.
+    const m = /--([^-]+)\.json$/.exec(f);
+    const rootId = m?.[1] ?? '';
+    const state = await readIndex(resolve(outputDir, f), rootId, '(unknown)');
     Object.assign(mergedPages, state.pages);
     for (const [id, p] of Object.entries(state.pages)) {
       mergedKnown.set(id, p.path);
@@ -380,18 +464,40 @@ async function runReconvert(): Promise<void> {
       }
       throw err;
     }
+    // Reconvert doesn't hit the network, so it can't refresh comment
+    // bodies. We have the comment stubs in state.pages[id].comments — keep
+    // the count + inline marker handling consistent, but the body of the
+    // Comments section will be empty placeholders until the next sync.
+    const inlineIds = new Set(
+      Object.entries(p.comments ?? {})
+        .filter(([, stub]) => stub.location === 'inline')
+        .map(([cid]) => cid),
+    );
     const conversion = convertStorageFormat(
       html,
       buildConvertOptions({
         pageId: id,
         pagePath: p.path,
         pageSpace: p.space,
-        baseUrl: config.base_url,
+        baseUrl,
         state: stubState,
         knownPagePaths: mergedKnown,
         titleIndex: mergedTitle,
+        inlineCommentIds: inlineIds,
       }),
     );
+    // Build a minimal "## Comments" placeholder from stubs so the .md stays
+    // close to the live shape between syncs. Empty section if no comments.
+    const placeholderComments = Object.entries(p.comments ?? {}).map(([cid, stub]): ConfluencePage => ({
+      id: cid,
+      type: 'comment',
+      title: '',
+      version: { number: stub.version },
+      ancestors: stub.parent_id ? [{ id: stub.parent_id, type: 'comment' }] : [],
+      extensions: { location: stub.location ?? undefined },
+      body: { storage: { value: '<p><em>(reconvert — comment body not on disk; run `npm start` to refresh)</em></p>', representation: 'storage' } },
+    }));
+    const commentsSection = buildCommentsSection(placeholderComments, conversion.inlineCommentAnchors);
     const body = buildMarkdownBody(
       {
         title: p.title,
@@ -399,20 +505,23 @@ async function runReconvert(): Promise<void> {
         last_modified: p.last_modified,
         last_modified_by: p.last_modified_by,
         webui_url: p.webui_url,
+        comments: Object.keys(p.comments ?? {}).length,
       },
       conversion.markdown,
+      commentsSection,
     );
     await writeFile(mdAbs, body, 'utf8');
     processed++;
   }
   log.info(`reconvert complete: ${processed} processed, ${skipped} skipped`);
+  void writeFile;
 }
 
 
 function usage(): void {
   console.error('usage: npm start -- [reconvert] [--includeNew] [--reset]');
-  console.error('default (no args): sync — CQL incremental, fetch only pages edited since last_sync.');
-  console.error('--includeNew: also pick up newly-created and deleted pages (DB walk, slower).');
+  console.error('default (no args): sync — CQL incremental for known roots, DB walk for new roots.');
+  console.error('--includeNew: also pick up newly-created and deleted pages on known roots (DB walk).');
   console.error('--reset:      wipe state and re-download every page from scratch.');
   console.error('reconvert:    regenerate every .md from the saved .html (no network).');
 }

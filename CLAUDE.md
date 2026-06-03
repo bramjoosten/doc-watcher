@@ -27,7 +27,7 @@ Node.js 24, TypeScript, run directly via Node's built-in type stripping — no t
 - `cheerio` for parsing Confluence storage-format XHTML.
 - In-house HTML→Markdown walker in `converter.ts` (no `turndown` — DOM-lib transitive deps kept tripping corp security scanners).
 - `zod` for typed config validation.
-- Config is a TypeScript module (`config.ts` at the project root, gitignored) that the user edits directly — no YAML parser, no `.env` file. The schema in `src/config.ts` exports a `ConfigInput` type, and the user's `config.ts` ends with `} satisfies ConfigInput` so typos surface in the editor instead of at runtime.
+- Config is a TypeScript module (`config.ts` at the project root, gitignored) that the user edits directly — no YAML parser, no `.env` file. The schema in `src/config.ts` exports a `ConfigInput` type, and the user's `config.ts` ends with `} satisfies ConfigInput` so typos surface in the editor instead of at runtime. The user supplies `roots` as full Confluence URLs (any of: `/pages/viewpage.action?pageId=`, `/spaces/<KEY>/pages/<id>/`, `/display/<KEY>/<Title>`, `/display/<KEY>`, `/spaces/viewspace.action?key=<KEY>`); `base_url` is derived from the first root's origin and there is no separate id field. `loadConfig` warns if a stale `config.yaml` / `config.yml` / `config.json` sits next to `config.ts` — only the TS module is read.
 
 **Minimize third-party dependencies.** Reach for the Node standard library first; a dep only earns its keep when the alternative would be hundreds of lines of nontrivial code (XHTML parsing, HTML→markdown conversion). **No native modules** — the tool has to install on locked-down corporate machines where the npm proxy MITMs TLS and prebuilt binaries fail to download. Pure JavaScript across the board. The CLI is a plain Node entry point using `process.argv` — no `commander` / `yargs` / etc. Logging is `console.log` / `console.error`. No test framework for now.
 
@@ -67,11 +67,12 @@ doc-watcher/
 ├── .gitignore                      # ignores config.ts, docs/, .claude/, node_modules/
 └── src/
     ├── taskmanager.ts              # entry point: sync / reconvert; --includeNew / --reset flags
-    ├── config.ts                   # zod schema, YAML loader
+    ├── config.ts                   # zod schema, TS-module loader, stale-yaml warning
+    ├── url-resolver.ts             # paste-a-URL roots → {baseUrl, pageId[]}; mixed-origin rejection
     ├── confluence.ts               # REST client (typed wrappers around fetch)
     ├── walker.ts                   # subtree enumeration: CQL fast path + /child/page DB walk
-    ├── downloader.ts               # parallel fetch + write, gated by the adaptive limiter
-    ├── converter.ts                # storage-format → markdown: cheerio macro pre-pass + in-house walker
+    ├── downloader.ts               # parallel fetch + write + comments rendering, gated by the limiter
+    ├── converter.ts                # storage-format → markdown: macro pre-pass + walker + inline-comment footnotes
     ├── pathing.ts                  # title → slug, rename detection
     ├── adaptive-limiter.ts         # slow-start + AIMD + budget-aware concurrency
     ├── state.ts                    # JSON state file: read, atomic write
@@ -102,11 +103,25 @@ docs/
 
 **Parent vs leaf.** A page with children becomes a folder `<slug>--<id>/` containing `_index.html` and `_index.md`. A leaf is two flat files. This mirrors the way most static-site tools think about hierarchy.
 
+### Root configuration: URLs in, ids out
+
+The user lists Confluence URLs in `roots` and `src/url-resolver.ts` turns each into a numeric page id at startup. Five URL shapes are accepted (see the config schema doc above); shapes that already carry an id (`?pageId=` and `/spaces/<KEY>/pages/<id>/`) resolve without a network call, the pretty `/display/<KEY>/<Title>` form costs one `GET /rest/api/content?spaceKey=&title=&limit=1` lookup, and the two space-homepage forms cost one `GET /rest/api/space/<KEY>?expand=homepage`. Mixed origins across roots are rejected — auth, the adaptive limiter, and rate-budget headers are all origin-scoped, so a second origin would silently break those. The first URL's origin becomes the `baseUrl` everywhere downstream.
+
+After URL resolution, `dropNestedRoots` walks each root's ancestor chain (one cheap `getPage(id, ['ancestors'])` per root, in parallel) and removes any root that lives under another configured root. The parent root's enumeration already covers the descendant, so keeping the child would just double the work and create two indexes that overlap. The dropped root prints a warning naming both URLs so the user can clean up `config.ts`.
+
+### Comments
+
+Page comments are folded into each page's `.md` rather than living in a sidecar file. One CQL call per root, `type = comment AND ancestor = <rootId>`, with `expand=version,container,ancestors,body.storage,extensions.location,extensions.inlineProperties`, returns every comment in the subtree with bodies. They're grouped by `container.id` (the page they're attached to) and passed into the downloader alongside the page list.
+
+The "needs re-fetch" diff widens slightly: a page is re-fetched if its body version changed OR the set of `(commentId, commentVersion)` changed since last sync. Comment-only changes still trigger a full page re-render because the body comes back free with `expand=body.storage`, so writing a fresh `.md` with the same body + the new Comments section is the simplest path. Per-page state grows a `comments: { [commentId]: { version, parent_id, location } }` map — stubs only, bodies aren't persisted because we re-fetch them every run anyway.
+
+Rendering: inline-anchored comments are emitted as a footnote-style `[c<n>]` link inline at the marker position, then collected at the end of the file under `## Comments → ### Inline`, each with the anchored selection as a blockquote so the reader has context for the discussion. Footer comments follow under `### Thread`. Both groups are threaded: replies nest under their parent with a deeper heading level (capped at h6 so deep chains stay valid). Top-level comments within each group sort chronologically (`version.when`, falling back to comment id for determinism). The frontmatter grows a `comments: <count>` field so `rg --json 'comments: [1-9]'` finds pages with discussion.
+
 ### Change detection
 
 Confluence Server has no dedicated sync endpoint, and the three types of change we care about (modification, creation, deletion) each have a different cost/freshness profile. So we offer two enumeration modes:
 
-**Default `sync` — CQL incremental.** One paginated call per root. When `state.last_sync` exists, the query carries a `lastmodified >=` filter, so the result is "just the pages edited since last run" — typically 1 request. On first run (or after `--reset` wiped state) the filter is omitted and CQL paginates the whole subtree.
+**Default `sync` — CQL incremental for known roots, DB walk for new roots.** One paginated call per root. When `state.last_sync` exists, the query carries a `lastmodified >=` filter, so the result is "just the pages edited since last run" — typically 1 request. For a root with no prior `last_sync` (first time it appears in `roots`, or after `--reset`) the sync forces the DB walk for that root only — CQL depends on Confluence's Lucene index, which often hasn't materialised descendant relationships for a freshly-watched root yet and would silently return zero results. The DB walk hits the content table directly and bypasses Lucene, so a brand-new root downloads correctly on its first run with no flags.
 
 ```
 GET /rest/api/content/search?cql=(id = N OR ancestor = N) AND type = page AND lastmodified >= "yyyy-MM-dd HH:mm"&expand=version,space,ancestors

@@ -3,13 +3,18 @@ import { dirname, join, posix } from 'node:path';
 import { AdaptiveLimiter } from './adaptive-limiter.ts';
 import type { Config } from './config.ts';
 import type { ConfluenceClient, ConfluencePage } from './confluence.ts';
-import { convertStorageFormat } from './converter.ts';
+import { convertStorageFormat, type InlineCommentAnchor } from './converter.ts';
+import { htmlToMarkdown } from './converter.ts';
 import { log } from './log.ts';
 import { folderIndexPath, htmlPathFor, leafPath, spaceIndexPath } from './pathing.ts';
-import type { PageState, StateFile } from './state.ts';
+import type { CommentStub, PageState, StateFile } from './state.ts';
 
 export interface DownloadOptions {
   config: Config;
+  // Derived Confluence origin (e.g. https://confluence.example.com). Lives
+  // outside `config` because the user no longer writes it directly — the URL
+  // resolver builds it from the first root URL's origin and passes it down.
+  baseUrl: string;
   client: ConfluenceClient;
   outputDir: string;
   state: StateFile;
@@ -33,6 +38,10 @@ export interface DownloadOptions {
   // (and by whom). Suppressed on first run / --reset to avoid spamming the
   // log with thousands of lines when every page looks new.
   logPerPage: boolean;
+  // Comments observed in this root's enumeration, grouped by container (page)
+  // id. Used to render the Comments section in each page's .md and to diff
+  // against the persisted CommentStub map for the "needs re-render" decision.
+  commentsByPageId: Map<string, ConfluencePage[]>;
 }
 
 export interface DownloadResult {
@@ -74,6 +83,7 @@ export interface MarkdownMetadata {
   last_modified: string | null;
   last_modified_by: string | null;
   webui_url: string;
+  comments: number;
 }
 
 function yamlString(s: string): string {
@@ -81,7 +91,7 @@ function yamlString(s: string): string {
   return `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
 
-export function buildMarkdownBody(meta: MarkdownMetadata, markdown: string): string {
+export function buildMarkdownBody(meta: MarkdownMetadata, markdown: string, commentsSection?: string): string {
   const lines = [
     '---',
     `title: ${yamlString(meta.title)}`,
@@ -89,6 +99,7 @@ export function buildMarkdownBody(meta: MarkdownMetadata, markdown: string): str
     `last_modified: ${meta.last_modified ? yamlString(meta.last_modified) : 'null'}`,
     `last_modified_by: ${meta.last_modified_by ? yamlString(meta.last_modified_by) : 'null'}`,
     `webui_url: ${yamlString(meta.webui_url)}`,
+    `comments: ${meta.comments}`,
     '---',
     '',
     `# ${meta.title}`,
@@ -96,7 +107,155 @@ export function buildMarkdownBody(meta: MarkdownMetadata, markdown: string): str
     markdown,
     '',
   ];
+  if (commentsSection) {
+    lines.push(commentsSection, '');
+  }
   return lines.join('\n');
+}
+
+// Build the "## Comments" section: inline comments first (each quoted with
+// the page text they anchor to), then footer comments. Both groups are
+// threaded — replies nest under their parent with deeper headings. Order
+// within a group is chronological by version.when, falling back to id so
+// the output is deterministic even when the API doesn't return timestamps.
+//
+// The `anchors` list ties inline comments back to their `[c<n>]` markers in
+// the body, so a reader who clicks `[c3]` lands on `<a name="c3">` here.
+export function buildCommentsSection(
+  comments: ConfluencePage[],
+  anchors: InlineCommentAnchor[],
+): string {
+  if (comments.length === 0) return '';
+
+  // Index for fast lookup; threading walks ancestors → parent comment id.
+  const byId = new Map<string, ConfluencePage>();
+  for (const c of comments) byId.set(c.id, c);
+
+  // Parent of a comment = nearest comment id in its ancestors chain. Anything
+  // that isn't a comment in that chain (the page itself) makes it top-level.
+  const parentOf = (c: ConfluencePage): string | null => {
+    const chain = c.ancestors ?? [];
+    for (let i = chain.length - 1; i >= 0; i--) {
+      const a = chain[i]!;
+      if (byId.has(a.id)) return a.id;
+    }
+    return null;
+  };
+
+  const childrenOf = new Map<string, ConfluencePage[]>();
+  const tops: ConfluencePage[] = [];
+  for (const c of comments) {
+    const parent = parentOf(c);
+    if (parent) {
+      const arr = childrenOf.get(parent) ?? [];
+      arr.push(c);
+      childrenOf.set(parent, arr);
+    } else {
+      tops.push(c);
+    }
+  }
+
+  const byTimeThenId = (a: ConfluencePage, b: ConfluencePage): number => {
+    const ta = a.version?.when ?? '';
+    const tb = b.version?.when ?? '';
+    if (ta !== tb) return ta.localeCompare(tb);
+    return a.id.localeCompare(b.id);
+  };
+  tops.sort(byTimeThenId);
+  for (const arr of childrenOf.values()) arr.sort(byTimeThenId);
+
+  const isInline = (c: ConfluencePage): boolean => c.extensions?.location === 'inline';
+  const inlineTops = tops.filter(isInline);
+  const footerTops = tops.filter((c) => !isInline(c));
+
+  const renderBody = (c: ConfluencePage): string => {
+    const html = c.body?.storage?.value ?? '';
+    // Reuse the page converter for comment bodies — they're the same storage
+    // format. No inline-comment-markers to worry about (comments on comments
+    // aren't a thing in Confluence DC).
+    return htmlToMarkdown(html).trim();
+  };
+
+  const anchorById = new Map<string, InlineCommentAnchor>();
+  for (const a of anchors) anchorById.set(a.commentId, a);
+
+  // Render one comment as a heading + body, then recurse into replies with a
+  // deeper heading. Heading depth caps at h6 so the output stays valid even
+  // for unusually long reply chains.
+  const renderComment = (c: ConfluencePage, depth: number, anchorId?: string): string => {
+    const headingLevel = Math.min(6, 2 + depth);
+    const heading = '#'.repeat(headingLevel);
+    const author = c.version?.by?.displayName ?? c.version?.by?.username ?? 'unknown';
+    const when = c.version?.when ?? '';
+    const anchorPrefix = anchorId ? `<a name="${anchorId}"></a>` : '';
+    const headerLine = `${heading} ${anchorPrefix}${author}${when ? ` — ${when}` : ''}`;
+    const body = renderBody(c);
+    const out: string[] = [headerLine, '', body, ''];
+    const replies = childrenOf.get(c.id) ?? [];
+    for (const r of replies) out.push(renderComment(r, depth + 1));
+    return out.join('\n');
+  };
+
+  const parts: string[] = ['## Comments', ''];
+  if (inlineTops.length > 0) {
+    parts.push('### Inline', '');
+    for (const c of inlineTops) {
+      const anchor = anchorById.get(c.id);
+      const selection = c.extensions?.inlineProperties?.originalSelection ?? anchor?.anchoredText ?? '';
+      const anchorId = anchor ? `c${anchor.order}` : undefined;
+      if (selection) {
+        parts.push(`> ${selection.replace(/\n/g, ' ')}`, '');
+      }
+      parts.push(renderComment(c, 1, anchorId));
+    }
+  }
+  if (footerTops.length > 0) {
+    parts.push('### Thread', '');
+    for (const c of footerTops) parts.push(renderComment(c, 1));
+  }
+
+  return parts.join('\n').replace(/\n{3,}/g, '\n\n').trimEnd();
+}
+
+// Diff helper — does the set of (commentId, version) match between persisted
+// state and what we just observed? Returns true when anything changed (add,
+// remove, version bump). Cheap because both inputs are small.
+export function commentsChanged(
+  persisted: Record<string, CommentStub>,
+  observed: ConfluencePage[],
+): boolean {
+  const persistedIds = new Set(Object.keys(persisted));
+  if (persistedIds.size !== observed.length) return true;
+  for (const c of observed) {
+    const stub = persisted[c.id];
+    if (!stub) return true;
+    if (stub.version !== (c.version?.number ?? 0)) return true;
+  }
+  return false;
+}
+
+// Build the persisted stub map from an observed list. Parent-comment id is
+// derived the same way as in buildCommentsSection — last comment-typed
+// ancestor in the chain, or '' for top-level.
+export function buildCommentStubs(observed: ConfluencePage[]): Record<string, CommentStub> {
+  const observedIds = new Set(observed.map((c) => c.id));
+  const out: Record<string, CommentStub> = {};
+  for (const c of observed) {
+    let parent = '';
+    const chain = c.ancestors ?? [];
+    for (let i = chain.length - 1; i >= 0; i--) {
+      if (observedIds.has(chain[i]!.id)) {
+        parent = chain[i]!.id;
+        break;
+      }
+    }
+    out[c.id] = {
+      version: c.version?.number ?? 0,
+      parent_id: parent,
+      location: c.extensions?.location ?? null,
+    };
+  }
+  return out;
 }
 
 function resolveRelativePagePath(pageRelPath: string, targetRelPath: string): string {
@@ -154,14 +313,19 @@ export function buildConvertOptions(args: {
   state: StateFile;
   knownPagePaths: Map<string, string>;
   titleIndex: Map<string, string>;
+  // Inline comment ids that exist for this page in the current sync. The
+  // converter uses this set to decide which markers to emit as footnotes;
+  // markers referring to resolved/deleted comments fall back to plain text.
+  inlineCommentIds?: Set<string>;
 }): Parameters<typeof convertStorageFormat>[1] {
-  const { pageId, pagePath, pageSpace, baseUrl, state, knownPagePaths, titleIndex } = args;
+  const { pageId, pagePath, pageSpace, baseUrl, state, knownPagePaths, titleIndex, inlineCommentIds } = args;
   // pagePath/pageSpace currently only relevant for attachment hrefs, which
   // we now render as absolute Confluence URLs instead of local paths.
   void pagePath;
   void pageSpace;
   return {
     pageId,
+    knownInlineCommentIds: inlineCommentIds,
     // Attachments are out of scope: we don't download them, but we still
     // need to render image hrefs in the markdown. Point them at the live
     // Confluence download URL so they at least resolve when viewed on a
@@ -192,6 +356,11 @@ async function fetchAndWriteOne(
   const relPath = pickPageRelPath(page, opts.pagesWithChildren, opts.rootPageIds);
   const absPath = join(opts.outputDir, relPath);
 
+  const comments = opts.commentsByPageId.get(page.id) ?? [];
+  const inlineIds = new Set(
+    comments.filter((c) => c.extensions?.location === 'inline').map((c) => c.id),
+  );
+
   const html = page.body?.storage?.value ?? '';
   const conversion = convertStorageFormat(
     html,
@@ -199,12 +368,15 @@ async function fetchAndWriteOne(
       pageId: page.id,
       pagePath: relPath,
       pageSpace: spaceKey,
-      baseUrl: opts.config.base_url,
+      baseUrl: opts.baseUrl,
       state: opts.state,
       knownPagePaths: opts.knownPagePaths,
       titleIndex: opts.titleIndex,
+      inlineCommentIds: inlineIds,
     }),
   );
+
+  const commentsSection = buildCommentsSection(comments, conversion.inlineCommentAnchors);
 
   // Write the raw storage-format HTML next to the .md so reconvert can rebuild the
   // markdown later without re-hitting Confluence.
@@ -215,9 +387,11 @@ async function fetchAndWriteOne(
       version: page.version?.number ?? 0,
       last_modified: page.version?.when ?? null,
       last_modified_by: page.version?.by?.displayName ?? null,
-      webui_url: buildWebUiUrl(opts.config.base_url, page),
+      webui_url: buildWebUiUrl(opts.baseUrl, page),
+      comments: comments.length,
     },
     conversion.markdown,
+    commentsSection,
   );
 
   await mkdir(dirname(absPath), { recursive: true });
@@ -259,6 +433,7 @@ export async function downloadPages(pages: ConfluencePage[], opts: DownloadOptio
           }
           // Update state in place.
           const detailedSpace = detailed.space?.key ?? 'UNKNOWN';
+          const pageComments = opts.commentsByPageId.get(detailed.id) ?? [];
           opts.state.pages[detailed.id] = {
             version: detailed.version?.number ?? 0,
             path: result.relPath,
@@ -267,7 +442,8 @@ export async function downloadPages(pages: ConfluencePage[], opts: DownloadOptio
             ancestors: (detailed.ancestors ?? []).map((a) => a.id),
             last_modified: detailed.version?.when ?? null,
             last_modified_by: detailed.version?.by?.displayName ?? null,
-            webui_url: buildWebUiUrl(opts.config.base_url, detailed),
+            webui_url: buildWebUiUrl(opts.baseUrl, detailed),
+            comments: buildCommentStubs(pageComments),
           };
           opts.knownPagePaths.set(detailed.id, result.relPath);
           opts.titleIndex.set(titleIndexKey(detailedSpace, detailed.title), detailed.id);

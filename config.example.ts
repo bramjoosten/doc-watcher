@@ -6,9 +6,6 @@ import type { ConfigInput } from './src/config.ts';
 // editor and turns typos into compile-time errors.
 
 export default {
-  // Root URL of your Confluence install (no trailing slash, no /rest/api).
-  base_url: 'https://confluence.example.com',
-
   // Confluence Server/DC Personal Access Token (Bearer auth).
   // Create one at: <your-confluence>/plugins/personalaccesstokens/usertokens.action
   // (or: profile picture → Settings → Personal Access Tokens → Create token).
@@ -24,10 +21,17 @@ export default {
   // doc-watcher source getting in the way.
   output_dir: '../docs',
 
-  // Confluence page id(s) whose subtree(s) to mirror. One id or a list:
-  //   root_page_ids: '123456',
-  //   root_page_ids: ['123456', '234567'],
-  // Find the id in the URL (?pageId=NNNNN); if you only see the pretty
-  // /display/SPACE/Title form, click Edit and the id appears.
-  root_page_ids: '123456',
+  // Confluence page or space URL(s) whose subtree(s) to mirror. Paste the
+  // URL from your browser address bar — any of these shapes work:
+  //   /pages/viewpage.action?pageId=12345      (id form, no lookup needed)
+  //   /spaces/<KEY>/pages/12345/Title          (newer DC style)
+  //   /display/<KEY>/Page+Title                (pretty form — one lookup)
+  //   /display/<KEY>                            (space homepage)
+  //   /spaces/viewspace.action?key=<KEY>        (space homepage, action form)
+  // The Confluence base URL is derived from the first URL's origin, so
+  // there's no separate base_url to keep in sync. All roots must share an
+  // origin (one Confluence per run). If you list a root that's nested
+  // under another root in your config, the descendant is dropped at startup
+  // with a warning — the parent already covers it.
+  roots: 'https://confluence.example.com/pages/viewpage.action?pageId=123456',
 } satisfies ConfigInput;

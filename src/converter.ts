@@ -12,12 +12,26 @@ export interface PageLinkRef {
   anchor?: string;
 }
 
+export interface InlineCommentAnchor {
+  // Page-stable order in which the marker appeared, 1-based. The .md footnote
+  // marker is `[^c<order>]` and the Comments section anchors with the same id.
+  order: number;
+  commentId: string;
+  // Text the inline comment was anchored to. The converter sees this in the
+  // marker's body and forwards it so the Comments section can quote it.
+  anchoredText: string;
+}
+
 export interface ConvertOptions {
   pageId: string;
   // Map of (spaceKey|undefined, pageTitle) → relative href used for ac:link[ri:page] resolution.
   resolvePageLink?: (ref: PageLinkRef) => string | undefined;
   // Map of attachment filename → relative href used for ac:image[ri:attachment].
   resolveImage?: (filename: string) => string;
+  // Known inline comment ids on this page — only markers whose ref is in this
+  // set get the footnote treatment. Unknown markers (e.g. resolved/deleted
+  // comments still in the storage format) just render their text plain.
+  knownInlineCommentIds?: Set<string>;
 }
 
 export interface ConvertResult {
@@ -25,6 +39,11 @@ export interface ConvertResult {
   images: ImageRef[];
   pageLinks: PageLinkRef[];
   unsupportedMacros: string[];
+  // One entry per recognised inline-comment marker, in the order they appeared
+  // in the body. Empty when the page has no inline comments. Pair this with
+  // the comment bodies (from PageState / live API) to render the Comments
+  // section with a numbered list that lines up with the inline footnotes.
+  inlineCommentAnchors: InlineCommentAnchor[];
 }
 
 const CALLOUT_TYPE_MAP: Record<string, string> = {
@@ -63,11 +82,13 @@ function getRichTextBody(macro: cheerio.Cheerio<AnyNode>): string {
 export function preprocessStorageFormat(
   html: string,
   opts: ConvertOptions,
-): { html: string; images: ImageRef[]; pageLinks: PageLinkRef[]; unsupportedMacros: string[] } {
+): { html: string; images: ImageRef[]; pageLinks: PageLinkRef[]; unsupportedMacros: string[]; inlineCommentAnchors: InlineCommentAnchor[] } {
   const $ = loadStorageFormat(html);
   const images: ImageRef[] = [];
   const pageLinks: PageLinkRef[] = [];
   const unsupportedMacros: string[] = [];
+  const inlineCommentAnchors: InlineCommentAnchor[] = [];
+  const known = opts.knownInlineCommentIds;
 
   $('ac\\:structured-macro').each((_, el) => {
     const macro = $(el);
@@ -141,13 +162,36 @@ export function preprocessStorageFormat(
     node.replaceWith(a);
   });
 
-  $('ac\\:emoticon, ac\\:placeholder, ac\\:task-list, ac\\:inline-comment-marker').each((_, el) => {
+  // Inline comment markers wrap the page text a comment was anchored to.
+  // We replace each one with the same text followed by a footnote-style
+  // reference that points to the Comments section appended at the end of
+  // the .md. Unknown / resolved comments (ref not in the active set) just
+  // render their text plain — same as the old behaviour.
+  $('ac\\:inline-comment-marker').each((_, el) => {
+    const node = $(el);
+    const ref = node.attr('ac:ref') ?? '';
+    const text = node.text();
+    if (ref && known?.has(ref)) {
+      const order = inlineCommentAnchors.length + 1;
+      inlineCommentAnchors.push({ order, commentId: ref, anchoredText: text });
+      // The span carries a sup with the footnote ref so the markdown walker
+      // emits `<text>[^c<n>]`. Using a stable HTML anchor (`a[href]`) so the
+      // emitted markdown link survives renderers that don't support GFM
+      // footnotes — the target anchors are real `<a name="c<n>">` markers
+      // injected by buildMarkdownBody at the Comments section.
+      node.replaceWith(`${text}<a href="#c${order}">[c${order}]</a>`);
+    } else {
+      node.replaceWith(text);
+    }
+  });
+
+  $('ac\\:emoticon, ac\\:placeholder, ac\\:task-list').each((_, el) => {
     const node = $(el);
     node.replaceWith(node.text());
   });
 
   const root = $('root').first();
-  return { html: root.html() ?? '', images, pageLinks, unsupportedMacros };
+  return { html: root.html() ?? '', images, pageLinks, unsupportedMacros, inlineCommentAnchors };
 }
 
 // ─── HTML → Markdown ───────────────────────────────────────────────────────
@@ -382,5 +426,6 @@ export function convertStorageFormat(html: string, opts: ConvertOptions): Conver
     images: pre.images,
     pageLinks: pre.pageLinks,
     unsupportedMacros: pre.unsupportedMacros,
+    inlineCommentAnchors: pre.inlineCommentAnchors,
   };
 }

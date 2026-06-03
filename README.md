@@ -14,9 +14,8 @@ cp config.example.ts config.ts
 
 Edit `config.ts`:
 
-- `base_url` — your Confluence root URL
 - `pat` — Personal Access Token (creation steps are in the file's comment)
-- `root_page_ids` — one page id or a list; each is the root of a subtree to mirror
+- `roots` — one Confluence URL or a list. Paste whatever URL you have in front of you: id form (`/pages/viewpage.action?pageId=`), pretty form (`/display/<SPACE>/Title`), space homepage (`/display/<SPACE>`), or the newer `/spaces/<SPACE>/pages/<id>/` shape. The Confluence base URL is derived from the origin, so there's no separate `base_url` to keep in sync. All roots must share an origin (one Confluence per run); if you list two roots and one happens to live under the other, the descendant is dropped at startup with a warning.
 
 `config.ts` is a TypeScript module — your editor will autocomplete the keys and flag typos thanks to the `satisfies ConfigInput` annotation at the bottom.
 
@@ -26,9 +25,11 @@ Edit `config.ts`:
 npm start
 ```
 
-Incremental sync. The first invocation paginates the whole subtree via CQL and downloads everything. Every later run uses a `lastmodified >= last_sync` filter, so it's typically one request that returns only the pages edited since last run — sub-second on a normal day. Resumable on Ctrl+C: just run again to pick up where you stopped. Concurrency self-tunes from Confluence's `X-RateLimit-*` headers — there's no knob to turn.
+Incremental sync. For a known root every later run uses a `lastmodified >= last_sync` CQL filter, so it's typically one request that returns only the pages edited since last run — sub-second on a normal day. A brand-new root (first appearance in `roots`, or after `--reset`) is downloaded via the DB walk path automatically, so it works on first run with no flags. Resumable on Ctrl+C: just run again to pick up where you stopped. Concurrency self-tunes from Confluence's `X-RateLimit-*` headers — there's no knob to turn.
 
-**New and deleted pages need an opt-in mode.** CQL goes through Confluence's Lucene index, which lags page creation by ~1 hour (existing-page edits are reflected instantly, since they trigger a synchronous per-page reindex), and a filtered CQL result can't tell "unchanged" from "deleted." Either re-run later, or pick them up immediately with a DB walk:
+**Page comments are folded into the `.md`.** Every sync pulls the comments under each root via a single CQL call, threads them, and appends a `## Comments` section to the page they belong to. Inline-anchored comments emit an inline footnote (`[c<n>]`) at their marker position; the Comments section quotes the anchored text so a reader has context. Footer comments follow as a threaded discussion. A page is re-rendered when either its body or its comment set changes.
+
+**New and deleted pages on existing roots need an opt-in mode.** CQL goes through Confluence's Lucene index, which lags page creation by ~1 hour on existing roots (existing-page edits are reflected instantly, since they trigger a synchronous per-page reindex), and a filtered CQL result can't tell "unchanged" from "deleted." Either re-run later, or pick them up immediately with a DB walk:
 
 ```sh
 npm start -- --includeNew  # recursive /child/page walk — slower, but sees new and deleted pages

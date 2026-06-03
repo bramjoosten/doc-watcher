@@ -2,6 +2,20 @@ import { appendFile, mkdir, readFile, readdir, rename, rm, writeFile } from 'nod
 import { dirname, join } from 'node:path';
 import { slugify } from './pathing.ts';
 
+// What we remember about a single comment between runs — just enough to
+// notice it's changed. The body itself isn't persisted; it comes back from
+// the comments CQL call (with expand=body.storage) on every sync and gets
+// rendered into the .md inline. So the cost of "comment version bumped"
+// is one re-render of the page using fresh in-memory comment data.
+export interface CommentStub {
+  version: number;
+  // Id of the comment this one replies to, if any. Empty string for top-level
+  // comments (those whose only ancestor is the page itself).
+  parent_id: string;
+  // 'inline' for inline-anchored comments, null for footer comments.
+  location: string | null;
+}
+
 export interface PageState {
   version: number;
   path: string;
@@ -11,6 +25,10 @@ export interface PageState {
   last_modified: string | null;       // ISO timestamp from page.version.when
   last_modified_by: string | null;    // displayName from page.version.by
   webui_url: string;                  // full clickable URL — base + /display/...
+  // Map of commentId → stub. Empty object when the page has no comments.
+  // The diff key is just `version`: any change between persisted and observed
+  // means the page needs a re-render so the .md picks up the new discussion.
+  comments: Record<string, CommentStub>;
 }
 
 export interface StateFile {
@@ -65,13 +83,21 @@ export async function readIndex(filePath: string, rootId: string, rootTitle: str
   try {
     const buf = await readFile(filePath, 'utf8');
     const parsed = JSON.parse(buf) as Partial<StateFile>;
+    const rawPages = (parsed.pages ?? {}) as Record<string, Partial<PageState>>;
+    const pages: Record<string, PageState> = {};
+    for (const [id, p] of Object.entries(rawPages)) {
+      // Backfill `comments` for index files written before comment support
+      // landed — an empty map looks the same as "no comments observed" so
+      // any actual comments in the next CQL sweep will be picked up.
+      pages[id] = { ...(p as PageState), comments: p.comments ?? {} };
+    }
     state = {
       total_watched_pages_on_remote: parsed.total_watched_pages_on_remote ?? 0,
       total_pages_downloaded: parsed.total_pages_downloaded ?? 0,
       root_page_id: parsed.root_page_id ?? rootId,
       root_title: parsed.root_title ?? rootTitle,
       last_sync: parsed.last_sync ?? null,
-      pages: parsed.pages ?? {},
+      pages,
     };
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;

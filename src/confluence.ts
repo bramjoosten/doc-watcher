@@ -31,6 +31,7 @@ export interface PageVersion {
 export interface PageAncestor {
   id: string;
   title?: string;
+  type?: string;
 }
 
 export interface PageSpace {
@@ -42,6 +43,15 @@ export interface PageBody {
   storage?: { value: string; representation: string };
 }
 
+export interface CommentExtensions {
+  // 'inline' on inline comments; absent/other on footer comments.
+  location?: string;
+  // Confluence returns this on inline comments — the page text the comment
+  // was anchored to. Lets us render a `> selected text` blockquote next to
+  // the comment body without round-tripping through the inline marker.
+  inlineProperties?: { originalSelection?: string };
+}
+
 export interface ConfluencePage {
   id: string;
   type: string;
@@ -50,6 +60,8 @@ export interface ConfluencePage {
   version?: PageVersion;
   ancestors?: PageAncestor[];
   body?: PageBody;
+  container?: { id: string; type?: string };
+  extensions?: CommentExtensions;
   _links?: { webui?: string; self?: string; base?: string };
 }
 
@@ -274,6 +286,47 @@ export class ConfluenceClient {
     }
     log.info(`CQL: ${out.length} pages returned in ${Date.now() - started}ms`);
     return out;
+  }
+
+  // Look up a page id by (space, title). Used by the URL resolver for the
+  // pretty /display/SPACE/Title URL form, which carries no id. Titles are
+  // unique per space in Confluence, so this is a stable lookup. Returns the
+  // first match — if Confluence somehow returns more than one we trust its
+  // ordering, no way to be smarter without ambiguity.
+  async findPageIdByTitle(spaceKey: string, title: string): Promise<string> {
+    const params = new URLSearchParams();
+    params.set('spaceKey', spaceKey);
+    params.set('title', title);
+    params.set('limit', '1');
+    const path = `/rest/api/content?${params.toString()}`;
+    const res = await this.request<ConfluenceListResponse<ConfluencePage>>(path);
+    const hit = res.results[0];
+    if (!hit) {
+      throw new Error(
+        `no page titled "${title}" in space "${spaceKey}" — was it renamed? Paste the current URL or use the /pages/viewpage.action?pageId= form.`,
+      );
+    }
+    return hit.id;
+  }
+
+  // Resolve a space's homepage to a page id. Used by the URL resolver for
+  // /display/<SPACE> and /spaces/viewspace.action?key=<SPACE> URLs.
+  async getSpaceHomepageId(spaceKey: string): Promise<string> {
+    const path = `/rest/api/space/${encodeURIComponent(spaceKey)}?expand=homepage`;
+    const res = await this.request<{ homepage?: { id: string } }>(path);
+    if (!res.homepage?.id) {
+      throw new Error(`space "${spaceKey}" has no homepage configured — pick a specific page URL instead`);
+    }
+    return res.homepage.id;
+  }
+
+  // All comments under a subtree, one paginated CQL call. Used to fold
+  // page discussion into the corresponding .md files. Comment versions are
+  // diffed per page just like page bodies, so unchanged comments don't
+  // trigger rewrites.
+  async searchCommentsBySubtree(rootId: string): Promise<ConfluencePage[]> {
+    const cql = `type = comment AND ancestor = ${rootId}`;
+    return this.searchByCQL(cql, ['version', 'container', 'ancestors', 'body.storage', 'extensions.location', 'extensions.inlineProperties']);
   }
 
   // Direct children of a page via Confluence's DB-backed child endpoint.
