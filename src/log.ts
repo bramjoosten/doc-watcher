@@ -28,3 +28,12 @@ export const log = {
   warn: (a: unknown, b?: unknown) => emit('warn', a, b),
   error: (a: unknown, b?: unknown) => emit('error', a, b),
 };
+
+// "no pages", "1 page", "5 pages". Centralises the 0-as-"none" convention so
+// log strings don't read like "0 of 0 downloaded (all 0 already up to date)".
+// Pluralisation is the dumb "+s" rule; pass `plural` explicitly for irregulars.
+export function n(count: number, singular: string, plural?: string): string {
+  if (count === 0) return `no ${plural ?? singular + 's'}`;
+  if (count === 1) return `1 ${singular}`;
+  return `${count} ${plural ?? singular + 's'}`;
+}

@@ -1,4 +1,5 @@
 import { log } from './log.ts';
+import { messages } from './messages.ts';
 
 export interface RateLimitBudget {
   limit: number;            // X-RateLimit-Limit
@@ -186,7 +187,7 @@ export class ConfluenceClient {
         this.notifyBudget(res.headers);
         if (backedOff && res.ok) {
           this.requestsRecoveredAfterBackoff++;
-          log.info(`recovered after backoff: ${shortUrl} succeeded on attempt ${attempt + 1}`);
+          log.info(messages.fetch.recovered(shortUrl, attempt + 1));
         }
         return res;
       }
@@ -210,7 +211,7 @@ export class ConfluenceClient {
       const cooldownAlreadyActive = Date.now() < this.throttledUntilMs;
       this.throttledUntilMs = Math.max(this.throttledUntilMs, Date.now() + waitMs);
       if (!cooldownAlreadyActive) {
-        log.warn(`rate limited (${res.status} ${res.statusText}) for ${shortUrl} on attempt ${attempt + 1}: ${bodySnippet || '(no body)'} — backing off ${waitMs}ms`);
+        log.warn(messages.fetch.rateLimited(res.status, res.statusText, shortUrl, attempt + 1, bodySnippet, waitMs));
         this.rateLimitObserver?.report429(waitMs);
       }
       await new Promise<void>((r) => setTimeout(r, waitMs));
@@ -276,15 +277,15 @@ export class ConfluenceClient {
     if (expand.length) params.set('expand', expand.join(','));
     const path = `/rest/api/content/search?${params.toString()}`;
     const out: ConfluencePage[] = [];
-    log.info(`CQL: ${cql}`);
     const started = Date.now();
     for await (const item of this.paginate<ConfluencePage>(path)) {
       out.push(item);
-      if (out.length % 100 === 0) {
-        log.info(`CQL: ${out.length} pages listed so far (${Date.now() - started}ms elapsed)`);
+      // Interim progress only after every 200 items — short enumerations
+      // (the common case for incremental syncs) shouldn't produce noise.
+      if (out.length > 0 && out.length % 200 === 0) {
+        log.info(messages.search.progress(out.length, Date.now() - started));
       }
     }
-    log.info(`CQL: ${out.length} pages returned in ${Date.now() - started}ms`);
     return out;
   }
 

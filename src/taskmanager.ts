@@ -19,6 +19,7 @@ import {
   titleIndexKey,
 } from './downloader.ts';
 import { log } from './log.ts';
+import { messages } from './messages.ts';
 import { htmlPathFor, pruneEmptyParents } from './pathing.ts';
 import { resolveRoots } from './url-resolver.ts';
 import { enumerateSubtree, enumerateViaCQL } from './walker.ts';
@@ -108,9 +109,7 @@ async function dropNestedRoots(
     const ancestors = ancestorsFor.get(id)!;
     const nestedUnder = [...idSet].find((other) => other !== id && ancestors.has(other));
     if (nestedUnder) {
-      log.warn(
-        `dropping nested root ${rootUrls.get(id) ?? id}: it lives under ${rootUrls.get(nestedUnder) ?? nestedUnder}, which already covers it`,
-      );
+      log.warn(messages.url.nestedRootDropped(rootUrls.get(id) ?? id, rootUrls.get(nestedUnder) ?? nestedUnder));
       continue;
     }
     kept.push(id);
@@ -128,9 +127,7 @@ async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<v
   // state seems to have vanished.
   const oldStatePath = resolve(outputDir, '.state.json');
   if (existsSync(oldStatePath)) {
-    log.warn(
-      `found legacy .state.json at ${oldStatePath} from before per-root indexes — ignored. Run \`npm start -- --reset\` to rebuild as per-root index files, then delete .state.json.`,
-    );
+    log.warn(messages.config.legacyState(oldStatePath));
   }
 
   const adaptiveLimiter = new AdaptiveLimiter({ max: MAX_PARALLEL_DOWNLOADS, slowStart: true });
@@ -159,9 +156,9 @@ async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<v
   }
   const totalLocal = roots.reduce((acc, r) => acc + Object.keys(r.state.pages).length, 0);
   const rootSummary = roots
-    .map((r) => `"${r.title}" (${r.rootId}, ${Object.keys(r.state.pages).length} pages, last_sync=${r.state.last_sync ?? 'never'})`)
+    .map((r) => `"${r.title}" (${r.rootId}, ${Object.keys(r.state.pages).length} pages, last sync ${r.state.last_sync ?? 'never'})`)
     .join('; ');
-  log.info(`loaded ${roots.length} root index file(s) — ${totalLocal} pages already on disk: ${rootSummary}`);
+  log.info(messages.sync.loadedRoots(roots.length, totalLocal, rootSummary));
 
   // Live root ids — used by pickPageRelPath to trim ancestor folders above
   // the root so the on-disk tree starts where the user said to.
@@ -193,11 +190,11 @@ async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<v
   for (const root of roots) {
     const useDbWalk = opts.includeNew;
     const mode = opts.includeNew
-      ? 'DB walk (slow, catches edits + creations + deletions)'
+      ? messages.sync.modeFullWalk
       : root.state.last_sync
-        ? `CQL incremental, lastmodified >= ${root.state.last_sync} (instant, edits only)`
-        : 'CQL full enumeration (first run / after --reset)';
-    log.info(`syncing root "${root.title}" (${root.rootId}) via ${mode}`);
+        ? messages.sync.modeIncremental(root.state.last_sync)
+        : messages.sync.modeFirstRun;
+    log.info(messages.sync.start(root.title, root.rootId, mode));
 
     const { pages: results, pagesWithChildren } = useDbWalk
       ? await enumerateSubtree(root.rootId, client, adaptiveLimiter)
@@ -205,19 +202,20 @@ async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<v
     const seen = new Map<string, (typeof results)[number]>();
     for (const r of results) seen.set(r.id, r);
 
-    // Soft safety net: on a first run, CQL goes through Lucene and can
-    // return zero (or near-zero) results if the indexer hasn't materialised
-    // descendant relationships for this root yet. Don't fall back silently
-    // — emit a hint pointing at --includeNew so the user can opt in to the
-    // DB walk explicitly. Triggers when last_sync was null and we got ≤1
-    // page back (just the root itself or nothing).
+    // Soft safety net: on a first run, the default sync goes through
+    // Confluence's search index, which may not have indexed descendant
+    // relationships for a freshly-watched section yet. Don't fall back
+    // silently — emit a hint pointing at --includeNew so the user can opt
+    // in to the full subtree walk explicitly. Triggers when last_sync was
+    // null and we got ≤1 page back (just the root itself or nothing).
     if (!opts.includeNew && !root.state.last_sync && seen.size <= 1) {
-      log.warn(`${root.title}: first-run CQL returned ${seen.size} page(s). If you expected more, Confluence's Lucene index may not have built descendant relationships for this root yet — try \`npm start -- --includeNew\` to walk the subtree directly via the DB.`);
+      log.warn(messages.sync.firstRunEmpty(root.title, seen.size));
     }
 
-    // Comments for the subtree, fetched once per root via CQL. The list is
-    // grouped by container.id so the downloader can render each page's
-    // comments inline and the diff loop below can spot comment-only changes.
+    // Comments for the subtree, fetched once per root regardless of mode.
+    // The list is grouped by container (page) id so the downloader can
+    // render comments inline and the diff loop can spot comment-only
+    // changes — including on pages whose body didn't change at all.
     const commentList = await client.searchCommentsBySubtree(root.rootId);
     const commentsByPageId = new Map<string, ConfluencePage[]>();
     for (const c of commentList) {
@@ -227,7 +225,7 @@ async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<v
       arr.push(c);
       commentsByPageId.set(pid, arr);
     }
-    log.info(`${root.title}: ${commentList.length} comment(s) across ${commentsByPageId.size} page(s)`);
+    log.info(messages.comments.found(root.title, commentList.length, commentsByPageId.size));
 
     for (const page of seen.values()) {
       knownPagePaths.set(page.id, pickPageRelPath(page, pagesWithChildren, rootPageIds));
@@ -235,22 +233,45 @@ async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<v
       if (sp) titleIndex.set(titleIndexKey(sp, page.title), page.id);
     }
 
-    // Pages needing a re-render = body version bumped OR new to us OR comment
-    // set changed. Comment-only changes still trigger a full page re-fetch
-    // because the body comes back free with `expand=body.storage`, and writing
-    // a fresh .md with the same body + new Comments section is the simplest
-    // path. On an incremental CQL run we don't see unchanged pages at all, so
-    // comment-only changes there are picked up on the next --includeNew sweep
-    // or full sync.
-    const remaining = [...seen.values()].filter((p) => {
+    // Pages needing a re-render fall into two buckets:
+    //
+    //  • In `seen` (returned by enumeration) — body version bumped, new to
+    //    us, or the comment set changed since last sync.
+    //  • NOT in `seen` (persisted but enumeration didn't return them, e.g.
+    //    an old page on an incremental CQL run) — comment set changed.
+    //    The comment fetch is global, so we have full visibility into
+    //    comment state for the whole subtree on every sync. Without this
+    //    second bucket, a new comment on an unedited page would wait
+    //    until --includeNew to surface.
+    //
+    // Both buckets reuse fetchAndWriteOne, which always pulls body+comments
+    // together. So the cost of "comment only changed on an old page" is
+    // one body fetch + one .md rewrite, no special-case rendering path.
+    const seenList = [...seen.values()];
+    const inSeenRemaining = seenList.filter((p) => {
       const prev = root.state.pages[p.id];
       if (!prev) return true;
       if (prev.version !== (p.version?.number ?? 0)) return true;
       const observedComments = commentsByPageId.get(p.id) ?? [];
       return commentsChanged(prev.comments ?? {}, observedComments);
     });
-    const newPageIds = new Set(remaining.filter((p) => !root.state.pages[p.id]).map((p) => p.id));
-    const updatedPageIds = new Set(remaining.filter((p) => root.state.pages[p.id]).map((p) => p.id));
+    const inSeenIds = new Set(seen.keys());
+    const commentOnlyRemaining: typeof seenList = [];
+    for (const [id, prev] of Object.entries(root.state.pages)) {
+      if (inSeenIds.has(id)) continue;
+      const observedComments = commentsByPageId.get(id) ?? [];
+      if (commentsChanged(prev.comments ?? {}, observedComments)) {
+        // Stub a ConfluencePage-shaped entry so fetchAndWriteOne knows the
+        // page id; downloadPages will fetch the full body before rendering.
+        commentOnlyRemaining.push({ id, type: 'page', title: prev.title } as (typeof seenList)[number]);
+      }
+    }
+    const remaining = [...inSeenRemaining, ...commentOnlyRemaining];
+    const newPageIds = new Set(inSeenRemaining.filter((p) => !root.state.pages[p.id]).map((p) => p.id));
+    const updatedPageIds = new Set([
+      ...inSeenRemaining.filter((p) => root.state.pages[p.id]).map((p) => p.id),
+      ...commentOnlyRemaining.map((p) => p.id),
+    ]);
 
     // `total_watched_pages_on_remote` is only meaningful after a full
     // enumeration. On a filtered incremental we'd be writing "changed
@@ -260,7 +281,7 @@ async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<v
       root.state.total_watched_pages_on_remote = seen.size;
     }
     root.state.total_pages_downloaded = Object.keys(root.state.pages).length;
-    log.info(`${root.title}: ${seen.size} page(s) in enumeration; ${remaining.length} need fetching (${newPageIds.size} new, ${updatedPageIds.size} updated)`);
+    log.info(messages.sync.enumerated(root.title, seen.size, remaining.length, newPageIds.size, updatedPageIds.size));
 
     // Per-page change logging is useful for incremental runs (you see
     // exactly what got picked up), noisy on a first run / --reset where
@@ -317,11 +338,11 @@ async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<v
           await pruneEmptyParents(mdAbs, outputDir);
           if (logPerPage) {
             const author = st.last_modified_by ?? 'unknown';
-            log.info(`[deleted] "${st.title}" (${id}) — last edited by ${author}`);
+            log.info(messages.cleanup.orphanDeleted(st.title, id, author));
           }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          log.warn(`orphan delete failed for ${id} (root ${root.rootId}): ${msg}`);
+          log.warn(messages.cleanup.orphanFailed(id, root.rootId, msg));
         }
         delete root.state.pages[id];
       }
@@ -330,7 +351,7 @@ async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<v
     if (result.errors.length === 0) {
       root.state.last_sync = syncIso;
     } else {
-      log.warn(`${root.title}: last_sync NOT advanced (frozen at ${root.state.last_sync ?? 'never'}) because ${result.errors.length} page(s) failed; they'll be retried next run`);
+      log.warn(messages.sync.checkpointFrozen(root.title, result.errors.length, root.state.last_sync));
     }
     root.state.total_pages_downloaded = Object.keys(root.state.pages).length;
     // Collapse the per-page .jsonl into a fresh .json snapshot and delete
@@ -373,23 +394,22 @@ async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<v
   if (allUpdated > 0) parts.push(`${allUpdated} updated`);
   if (allDeleted > 0) parts.push(`${allDeleted} deleted`);
   const breakdown = parts.length > 0 ? ` (${parts.join(', ')})` : '';
-  const skippedNote = allSkipped > 0 ? `; ${allSkipped} skipped (already up to date)` : '';
 
   let headline: string;
   if (totalChanges === 0 && allErrors === 0) {
-    headline = `no changes across ${roots.length} root(s) — 0 of ${allCandidates} downloaded (all ${allSkipped} already up to date)`;
+    headline = messages.summary.noChanges(roots.length, allCandidates, allSkipped);
   } else {
-    headline = `${totalChanges} change${totalChanges === 1 ? '' : 's'} across ${roots.length} root(s)${breakdown} — ${allDownloaded} of ${allCandidates} downloaded${skippedNote}`;
+    headline = messages.summary.changes(totalChanges, roots.length, breakdown, allDownloaded, allCandidates, allSkipped);
   }
   if (allErrors > 0) {
     const errParts = Object.entries(allErrorSummary).map(([k, v]) => `${k}=${v}`).join(', ');
-    headline += `. ${allErrors} error${allErrors === 1 ? '' : 's'} (${errParts}) — re-run \`npm start\` to retry.`;
+    headline += messages.summary.errorSuffix(allErrors, errParts);
   }
 
   log.info(headline);
 
   if (!opts.includeNew) {
-    log.info(`latest modifications synced. Newly-created and deleted pages take ~1 hour to appear via the index — re-run later, or run \`npm start -- --includeNew\` to pick them up immediately (slower, walks the DB).`);
+    log.info(messages.summary.newDeletedHint);
   }
 
   // Throttle stats — "of N HTTP requests, M had to back off." Useful to gauge
@@ -398,9 +418,7 @@ async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<v
   const recovered = client.requestsRecoveredAfterBackoff;
   const failedAfterRetries = client.requestsFailedAfterRetries;
   if (recovered > 0 || failedAfterRetries > 0) {
-    const pct = total > 0 ? Math.round((recovered / total) * 100) : 0;
-    const failedNote = failedAfterRetries > 0 ? `; ${failedAfterRetries} gave up after the retry budget` : '';
-    log.info(`throttle: ${recovered} of ${total} requests (${pct}%) had to back off and retry${failedNote}`);
+    log.info(messages.speedOptimizer.retried(recovered, total, failedAfterRetries));
   }
 
 }
@@ -443,7 +461,7 @@ async function runReconvert(): Promise<void> {
 
   const allPages = Object.entries(mergedPages);
   if (allPages.length === 0) {
-    log.warn('no index files found; nothing to reconvert. Run `npm start` first.');
+    log.warn(messages.reconvert.nothing);
     return;
   }
 
@@ -460,7 +478,7 @@ async function runReconvert(): Promise<void> {
       html = await readFile(htmlAbs, 'utf8');
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-        log.warn(`no .html for page ${id} at ${htmlPathFor(p.path)}; skip (run sync to fetch)`);
+        log.warn(messages.reconvert.missingHtml(id, htmlPathFor(p.path)));
         skipped++;
         continue;
       }
@@ -515,7 +533,7 @@ async function runReconvert(): Promise<void> {
     await writeFile(mdAbs, body, 'utf8');
     processed++;
   }
-  log.info(`reconvert complete: ${processed} processed, ${skipped} skipped`);
+  log.info(messages.reconvert.done(processed, skipped));
   void writeFile;
 }
 

@@ -18,6 +18,7 @@
 //    first place rather than reacting after the fact.
 
 import { log } from './log.ts';
+import { messages } from './messages.ts';
 
 const LOW_BUDGET_RATIO = 0.2;
 const CRITICAL_BUDGET_RATIO = 0.05;
@@ -64,7 +65,7 @@ export class AdaptiveLimiter {
     const prev = this.capacity;
     this.capacity = Math.min(this.max, Math.max(1, target));
     if (this.capacity > prev) {
-      log.info(`limiter warm-up: capacity ${prev} → ${this.capacity} (max ${this.max})`);
+      log.info(messages.speedOptimizer.warmedUp(this.capacity, this.max));
       this.tryWake();
     }
   }
@@ -118,7 +119,7 @@ export class AdaptiveLimiter {
     if (!this.firstBudgetLogged) {
       this.firstBudgetLogged = true;
       const perSec = budget.fillRate / budget.intervalSeconds;
-      log.info(`server rate limit: ${budget.limit}-token bucket, ${budget.remaining} remaining, fills at ${budget.fillRate}/${budget.intervalSeconds}s = ${perSec.toFixed(2)} req/s sustainable`);
+      log.info(messages.speedOptimizer.serverBudget(perSec, budget.remaining, budget.limit));
     }
 
     const ratio = budget.remaining / budget.limit;

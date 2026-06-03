@@ -31,6 +31,8 @@ Node.js 24, TypeScript, run directly via Node's built-in type stripping — no t
 
 **Minimize third-party dependencies.** Reach for the Node standard library first; a dep only earns its keep when the alternative would be hundreds of lines of nontrivial code (XHTML parsing, HTML→markdown conversion). **No native modules** — the tool has to install on locked-down corporate machines where the npm proxy MITMs TLS and prebuilt binaries fail to download. Pure JavaScript across the board. The CLI is a plain Node entry point using `process.argv` — no `commander` / `yargs` / etc. Logging is `console.log` / `console.error`. No test framework for now.
 
+**User-facing log copy is centralised in `src/messages.ts`.** Each module imports `messages` and calls a function or constant from the right group (`messages.sync.start(...)`, `messages.summary.changes(...)`, etc.). Two reasons: (1) wording stays consistent ("watched section", "speed optimizer", etc. — never "root", never "AIMD limiter") and (2) you can edit copy without grepping the codebase. The `n(count, 'page')` helper from `log.ts` handles "no pages / 1 page / 5 pages" so callers don't special-case zero or plural; never produce "0 of N" — say "none" instead.
+
 ### State: per-root JSON indexes (source of truth) + lightweight frontmatter view
 
 State lives in **per-root index files** at `<output_dir>/index-<slug>--<root_id>.json` — one per entry in `root_page_ids`. Each index covers the pages in its own subtree; the indexes are independent on disk but the resolver maps that link pages to local paths are merged across indexes at runtime so cross-root `ac:link` references still resolve. Writes are atomic via `tmp` + `rename` — interrupted runs never leave a half-written index file.
@@ -74,9 +76,10 @@ doc-watcher/
     ├── downloader.ts               # parallel fetch + write + comments rendering, gated by the limiter
     ├── converter.ts                # storage-format → markdown: macro pre-pass + walker + inline-comment footnotes
     ├── pathing.ts                  # title → slug, rename detection
-    ├── adaptive-limiter.ts         # slow-start + AIMD + budget-aware concurrency
+    ├── adaptive-limiter.ts         # slow-start + AIMD + budget-aware concurrency (presented as "speed optimizer" in user-facing logs)
     ├── state.ts                    # JSON state file: read, atomic write
-    └── log.ts
+    ├── messages.ts                 # all user-facing log copy, centralised + grouped by area; uses n() for zero-aware pluralisation
+    └── log.ts                      # leveled console logger + n() helper
 ```
 
 ### Output layout (`output_dir` mirrors Confluence — defaults to `../docs`, a sibling of the repo)
@@ -113,7 +116,7 @@ After URL resolution, `dropNestedRoots` walks each root's ancestor chain (one ch
 
 Page comments are folded into each page's `.md` rather than living in a sidecar file. One CQL call per root, `type = comment AND ancestor = <rootId>`, with `expand=version,container,ancestors,body.storage,extensions.location,extensions.inlineProperties`, returns every comment in the subtree with bodies. They're grouped by `container.id` (the page they're attached to) and passed into the downloader alongside the page list.
 
-The "needs re-fetch" diff widens slightly: a page is re-fetched if its body version changed OR the set of `(commentId, commentVersion)` changed since last sync. Comment-only changes still trigger a full page re-render because the body comes back free with `expand=body.storage`, so writing a fresh `.md` with the same body + the new Comments section is the simplest path. Per-page state grows a `comments: { [commentId]: { version, parent_id, location } }` map — stubs only, bodies aren't persisted because we re-fetch them every run anyway.
+The "needs re-fetch" diff widens slightly and runs in two passes. Pass 1 — pages CQL/DB-walk returned: re-fetch if body version changed OR comment set changed. Pass 2 — pages NOT returned by enumeration but already persisted in state: re-fetch if their comment set changed. The comments CQL call is global (no `lastmodified` filter), so we have full visibility into the subtree's comment state on every sync regardless of mode; pass 2 means a new comment on an unedited page surfaces on the next plain `npm start`, no need for `--includeNew`. Comment-only changes still trigger a full page re-fetch because the body comes back free with `expand=body.storage`, so writing a fresh `.md` with the same body + the new Comments section is the simplest path. Per-page state grows a `comments: { [commentId]: { version, parent_id, location } }` map — stubs only, bodies aren't persisted because we re-fetch them every run anyway.
 
 Rendering: inline-anchored comments are emitted as a footnote-style `[c<n>]` link inline at the marker position, then collected at the end of the file under `## Comments → ### Inline`, each with the anchored selection as a blockquote so the reader has context for the discussion. Footer comments follow under `### Thread`. Both groups are threaded: replies nest under their parent with a deeper heading level (capped at h6 so deep chains stay valid). Top-level comments within each group sort chronologically (`version.when`, falling back to comment id for determinism). The frontmatter grows a `comments: <count>` field so `rg --json 'comments: [1-9]'` finds pages with discussion.
 

@@ -4,6 +4,7 @@ import { dirname, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { z } from 'zod';
 import { log } from './log.ts';
+import { messages } from './messages.ts';
 
 // `~` is a shell construct; Node doesn't expand it. Doing it manually so users
 // can put `output_dir: '~/my-confluence-docs'` in config.ts without surprise.
@@ -54,7 +55,7 @@ export async function loadConfig(
   const dir = dirname(configPath);
   for (const stale of ['config.yaml', 'config.yml', 'config.json']) {
     if (existsSync(resolve(dir, stale))) {
-      log.warn(`found ${stale} next to config.ts — this file is IGNORED; only config.ts is read. Move your settings into config.ts.`);
+      log.warn(messages.config.staleConfigFile(stale));
     }
   }
   let mod: { default?: unknown };

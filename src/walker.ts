@@ -28,7 +28,7 @@ export async function enumerateSubtree(
   limiter: AdaptiveLimiter,
 ): Promise<SubtreeEnumeration> {
   const started = Date.now();
-  log.info(`walking subtree under root ${rootId} via /child/page (DB-backed, streaming pool)`);
+  log.info(`walking subtree under section ${rootId} (full coverage, slower)`);
 
   // /child/page is a cheap parent_id lookup against the content table —
   // not the heavy body download the limiter's slow-start was designed
@@ -73,8 +73,11 @@ export async function enumerateSubtree(
   // making forward progress?).
   const progressTimer = setInterval(() => {
     log.info(
-      `walking: ${pages.length} discovered, ${parentsFetched} parents fetched, ${pending.size} in flight, limiter at ${limiter.currentCapacity}, ${Math.round((Date.now() - started) / 1000)}s elapsed`,
+      `still walking — ${pages.length} pages found so far, ${pending.size} in flight (${Math.round((Date.now() - started) / 1000)}s elapsed)`,
     );
+    // limiter capacity is still tracked for the speed-optimizer state machine;
+    // we just don't surface it on every progress tick.
+    void limiter;
   }, 5000);
 
   try {
@@ -89,7 +92,7 @@ export async function enumerateSubtree(
     clearInterval(progressTimer);
   }
 
-  log.info(`walked ${pages.length} pages (${pagesWithChildren.size} parents) under root ${rootId} in ${Date.now() - started}ms`);
+  log.info(`walked ${pages.length} pages under section ${rootId} in ${Math.round((Date.now() - started) / 1000)}s`);
   return { pages, pagesWithChildren };
 }
 

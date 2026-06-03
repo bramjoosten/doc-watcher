@@ -6,6 +6,7 @@ import type { ConfluenceClient, ConfluencePage } from './confluence.ts';
 import { convertStorageFormat, type InlineCommentAnchor } from './converter.ts';
 import { htmlToMarkdown } from './converter.ts';
 import { log } from './log.ts';
+import { messages } from './messages.ts';
 import { folderIndexPath, htmlPathFor, leafPath, spaceIndexPath } from './pathing.ts';
 import type { CommentStub, PageState, StateFile } from './state.ts';
 
@@ -429,7 +430,7 @@ export async function downloadPages(pages: ConfluencePage[], opts: DownloadOptio
           if (opts.logPerPage) {
             const verb = previouslyKnown ? 'modified' : 'created';
             const author = detailed.version?.by?.displayName ?? 'unknown';
-            log.info(`[${verb}] "${detailed.title}" (${detailed.id}) by ${author}`);
+            log.info(messages.fetch.pageChange(verb as 'created' | 'modified', detailed.title, detailed.id, author));
           }
           // Update state in place.
           const detailedSpace = detailed.space?.key ?? 'UNKNOWN';
@@ -455,7 +456,7 @@ export async function downloadPages(pages: ConfluencePage[], opts: DownloadOptio
 
           const now = Date.now();
           if (now - lastProgressAt >= PROGRESS_INTERVAL_MS) {
-            log.info(`progress: ${written.length} of ${total} downloaded`);
+            log.info(messages.fetch.progress(written.length, total));
             lastProgressAt = now;
           }
           // Persist after every successful page so an interrupt is recoverable.
@@ -467,12 +468,12 @@ export async function downloadPages(pages: ConfluencePage[], opts: DownloadOptio
               await opts.flushState(detailed.id);
             } catch (err) {
               const msg = err instanceof Error ? err.message : String(err);
-              log.warn(`failed to flush state mid-sync for ${detailed.id} (will retry on next page): ${msg}`);
+              log.warn(messages.fetch.flushFailed(detailed.id, msg));
             }
           }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          log.error(`page fetch failed for ${page.id}: ${msg}`);
+          log.error(messages.fetch.failed(page.id, msg));
           errors.push({ id: page.id, error: err });
         }
       }),
