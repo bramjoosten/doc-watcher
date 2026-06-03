@@ -2,17 +2,13 @@
 // Disable TLS cert verification + silence the resulting warning. Must import
 // FIRST so it runs before any HTTPS connection is made.
 import './disable-tls-check.ts';
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { AdaptiveLimiter } from './adaptive-limiter.ts';
 import { loadConfig } from './config.ts';
 import { ConfluenceClient, type ConfluencePage } from './confluence.ts';
-import { convertStorageFormat } from './converter.ts';
 import {
-  buildCommentsSection,
-  buildConvertOptions,
-  buildMarkdownBody,
   commentsChanged,
   downloadPages,
   pickPageRelPath,
@@ -424,156 +420,30 @@ async function runSync(opts: { reset: boolean; includeNew: boolean }): Promise<v
 }
 
 
-async function runReconvert(): Promise<void> {
-  const { config, rootDir } = await loadConfig();
-  const outputDir = resolve(rootDir, config.output_dir);
-  const baseUrl = new URL(config.roots[0]!).origin;
-
-  // Load every per-root index, merging into one big map for the resolver.
-  // We don't need a client here — reconvert is network-free, working entirely
-  // from the saved .html files on disk plus the resolver maps in state.
-  // Discovery is by glob: every `index-*--<id>.json` next to outputDir gets
-  // picked up regardless of which roots are currently in config, so a
-  // reconvert after a root removal still rebuilds the on-disk corpus.
-  const mergedPages: StateFile['pages'] = {};
-  const mergedKnown = new Map<string, string>();
-  const mergedTitle = new Map<string, string>();
-  const { readdir } = await import('node:fs/promises');
-  let entries: string[] = [];
-  try {
-    entries = await readdir(outputDir);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
-  }
-  const indexFiles = entries.filter((e) => e.startsWith('index-') && e.endsWith('.json'));
-  for (const f of indexFiles) {
-    // Extract id from the `--<id>.json` suffix to drive readIndex's rootId
-    // default; the file's stored root_page_id wins anyway.
-    const m = /--([^-]+)\.json$/.exec(f);
-    const rootId = m?.[1] ?? '';
-    const state = await readIndex(resolve(outputDir, f), rootId, '(unknown)');
-    Object.assign(mergedPages, state.pages);
-    for (const [id, p] of Object.entries(state.pages)) {
-      mergedKnown.set(id, p.path);
-      if (p.space && p.title) mergedTitle.set(titleIndexKey(p.space, p.title), id);
-    }
-  }
-
-  const allPages = Object.entries(mergedPages);
-  if (allPages.length === 0) {
-    log.warn(messages.reconvert.nothing);
-    return;
-  }
-
-  // Build a stub state for buildConvertOptions (only state.pages is read).
-  const stubState = { ...emptyState('', ''), pages: mergedPages };
-
-  let processed = 0;
-  let skipped = 0;
-  for (const [id, p] of allPages) {
-    const mdAbs = resolve(outputDir, p.path);
-    const htmlAbs = htmlPathFor(mdAbs);
-    let html: string;
-    try {
-      html = await readFile(htmlAbs, 'utf8');
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-        log.warn(messages.reconvert.missingHtml(id, htmlPathFor(p.path)));
-        skipped++;
-        continue;
-      }
-      throw err;
-    }
-    // Reconvert doesn't hit the network, so it can't refresh comment
-    // bodies. We have the comment stubs in state.pages[id].comments — keep
-    // the count + inline marker handling consistent, but the body of the
-    // Comments section will be empty placeholders until the next sync.
-    const inlineIds = new Set(
-      Object.entries(p.comments ?? {})
-        .filter(([, stub]) => stub.location === 'inline')
-        .map(([cid]) => cid),
-    );
-    const conversion = convertStorageFormat(
-      html,
-      buildConvertOptions({
-        pageId: id,
-        pagePath: p.path,
-        pageSpace: p.space,
-        baseUrl,
-        state: stubState,
-        knownPagePaths: mergedKnown,
-        titleIndex: mergedTitle,
-        inlineCommentIds: inlineIds,
-      }),
-    );
-    // Build a minimal "## Comments" placeholder from stubs so the .md stays
-    // close to the live shape between syncs. Empty section if no comments.
-    const placeholderComments = Object.entries(p.comments ?? {}).map(([cid, stub]): ConfluencePage => ({
-      id: cid,
-      type: 'comment',
-      title: '',
-      version: { number: stub.version },
-      ancestors: stub.parent_id ? [{ id: stub.parent_id, type: 'comment' }] : [],
-      extensions: { location: stub.location ?? undefined },
-      body: { storage: { value: '<p><em>(reconvert — comment body not on disk; run `npm start` to refresh)</em></p>', representation: 'storage' } },
-    }));
-    const commentsSection = buildCommentsSection(placeholderComments, conversion.inlineCommentAnchors);
-    const body = buildMarkdownBody(
-      {
-        title: p.title,
-        version: p.version,
-        last_modified: p.last_modified,
-        last_modified_by: p.last_modified_by,
-        webui_url: p.webui_url,
-        comments: Object.keys(p.comments ?? {}).length,
-      },
-      conversion.markdown,
-      commentsSection,
-    );
-    await writeFile(mdAbs, body, 'utf8');
-    processed++;
-  }
-  log.info(messages.reconvert.done(processed, skipped));
-  void writeFile;
-}
-
-
 function usage(): void {
-  console.error('usage: npm start -- [reconvert] [--includeNew] [--reset]');
-  console.error('default (no args): sync — CQL incremental for known roots, DB walk for new roots.');
-  console.error('--includeNew: also pick up newly-created and deleted pages on known roots (DB walk).');
+  console.error('usage: npm start -- [--includeNew] [--reset]');
+  console.error('default (no args): incremental sync — picks up edits since the last run.');
+  console.error('--includeNew: also pick up newly-created and deleted pages (full subtree walk, slower).');
   console.error('--reset:      wipe state and re-download every page from scratch.');
-  console.error('reconvert:    regenerate every .md from the saved .html (no network).');
 }
 
-const [, , maybeCmd, ...rest] = process.argv;
-const cmd = maybeCmd && !maybeCmd.startsWith('--') ? maybeCmd : 'sync';
-const flags = [maybeCmd, ...rest].filter((a): a is string => typeof a === 'string' && a.startsWith('--'));
+const flags = process.argv.slice(2).filter((a): a is string => a.startsWith('--'));
 const includeNew = flags.includes('--includeNew');
 const reset = flags.includes('--reset');
 const helpRequested = flags.includes('--help') || flags.includes('-h');
+const unknownFlag = flags.find((f) => !['--includeNew', '--reset', '--help', '-h'].includes(f));
 
 (async () => {
   if (helpRequested) {
     usage();
     return;
   }
-  switch (cmd) {
-    case 'sync':
-      await runSync({ reset, includeNew });
-      break;
-    case 'reconvert':
-      await runReconvert();
-      break;
-    case '--help':
-    case '-h':
-      usage();
-      break;
-    default:
-      console.error(`unknown command: ${cmd}`);
-      usage();
-      process.exit(1);
+  if (unknownFlag) {
+    console.error(`unknown flag: ${unknownFlag}`);
+    usage();
+    process.exit(1);
   }
+  await runSync({ reset, includeNew });
 })().catch((err) => {
   // Print the error and any `cause` chain (undici stacks DNS/TCP/TLS
   // failures under .cause as a TypeError("fetch failed") wrapper). For

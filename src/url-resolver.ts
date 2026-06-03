@@ -23,14 +23,12 @@ type Classification =
   | { kind: 'space-home'; spaceKey: string }
   | { kind: 'short-link' };
 
-// Pathname normalisation that runs before every regex match:
-//   • Strip the /wiki prefix that Confluence Cloud puts on every URL.
-//   • Strip a single trailing slash so /spaces/ENG and /spaces/ENG/ match the
-//     same regex without each pattern having to repeat `/?` itself.
+// Pathname normalisation that runs before every regex match: strip a single
+// trailing slash so /spaces/ENG and /spaces/ENG/ match the same regex without
+// each pattern having to repeat `/?` itself.
 function normalisePath(pathname: string): string {
-  const noWiki = pathname.replace(/^\/wiki(?=\/)/, '');
-  if (noWiki.length > 1 && noWiki.endsWith('/')) return noWiki.slice(0, -1);
-  return noWiki;
+  if (pathname.length > 1 && pathname.endsWith('/')) return pathname.slice(0, -1);
+  return pathname;
 }
 
 function classify(url: URL): Classification | null {
@@ -160,7 +158,7 @@ async function resolveOne(href: string, client: ConfluenceClient, depth: number)
   const classified = classify(url);
   if (!classified) {
     throw new Error(
-      `unrecognised Confluence URL shape: ${href}. Supported: /pages/viewpage.action?pageId=, /spaces/<KEY>/pages/<id>/, /pages/<id>, /spaces/<KEY>/overview, /spaces/<KEY>, /spaces/<KEY>/pages, /display/<KEY>/<Title>, /display/<KEY>, /spaces/viewspace.action?key=<KEY>, /x/<token>. The /wiki prefix (Confluence Cloud) is auto-stripped.`,
+      `unrecognised Confluence URL shape: ${href}. Supported: /pages/viewpage.action?pageId=, /spaces/<KEY>/pages/<id>/, /pages/<id>, /spaces/<KEY>/overview, /spaces/<KEY>, /spaces/<KEY>/pages, /display/<KEY>/<Title>, /display/<KEY>, /spaces/viewspace.action?key=<KEY>, /x/<token>. doc-watcher targets self-hosted Confluence (Data Center / Server) — Cloud has a different auth + path layout and isn't supported.`,
     );
   }
   if (classified.kind === 'id') return classified.pageId;

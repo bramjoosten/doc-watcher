@@ -1,13 +1,13 @@
 # doc-watcher
 
-Mirror Confluence Server pages to local files — raw HTML alongside converted Markdown, incrementally re-synced. PAT-authenticated, CLI, built for `rg` and local AI workflows.
+Download and watch changes on Confluence docs. Confluence Data Center only, not Cloud.
 
 ## Setup
 
 ```sh
 git clone https://code.bramjoosten.nl/bram/doc-watcher.git
 cd doc-watcher
-nvm use            # picks up .nvmrc → Node 24
+nvm use            # optional — picks up .nvmrc → Node 24. If you don't use nvm, just make sure `node --version` is 24+.
 npm install
 cp config.example.ts config.ts
 ```
@@ -15,7 +15,7 @@ cp config.example.ts config.ts
 Edit `config.ts`:
 
 - `pat` — Personal Access Token (creation steps are in the file's comment)
-- `roots` — one Confluence URL or a list. Paste whatever URL you have in front of you and it'll be classified: anything carrying a `?pageId=<id>` (viewpage / editpage / copypage / draft endpoints), the newer permalink `/spaces/<KEY>/pages/<id>/`, the flat `/pages/<id>`, the pretty `/display/<KEY>/Title`, all four space-homepage flavours (`/display/<KEY>`, `/spaces/<KEY>`, `/spaces/<KEY>/overview`, `/spaces/viewspace.action?key=<KEY>`), and Confluence's `/x/<token>` Share-menu short links (one redirect-follow). The Cloud `/wiki/` prefix is auto-stripped, trailing slashes are tolerated. The Confluence base URL is derived from the origin, so there's no separate `base_url` to keep in sync. All roots must share an origin (one Confluence per run); if you list two roots and one happens to live under the other, the descendant is dropped at startup with a warning.
+- `roots` — one Confluence URL or a list. Paste whatever page or space URL you have in front of you; doc-watcher figures out which Confluence page that points to. The base URL is derived from the origin, so there's no separate `base_url`. All roots must share an origin (one Confluence per run); if you list two roots and one happens to live under the other, the descendant is dropped at startup with a warning.
 
 `config.ts` is a TypeScript module — your editor will autocomplete the keys and flag typos thanks to the `satisfies ConfigInput` annotation at the bottom.
 
@@ -27,7 +27,7 @@ npm start
 
 Incremental sync. The first invocation paginates the whole subtree via CQL and downloads everything. Every later run uses a `lastmodified >= last_sync` filter, so it's typically one request that returns only the pages edited since last run — sub-second on a normal day. Resumable on Ctrl+C: just run again to pick up where you stopped. Concurrency self-tunes from Confluence's `X-RateLimit-*` headers — there's no knob to turn.
 
-**Heads-up for brand-new roots.** CQL goes through Confluence's Lucene index, which may not have materialised descendant relationships for a freshly-watched root yet — on a first run that returns ≤1 page, doc-watcher prints a hint pointing at `--includeNew` so you can opt into the DB walk explicitly. It never falls back silently.
+**Confluence Data Center index gotcha's.** The default sync goes through Confluence's search index, which may not have indexed a freshly-watched section yet (descendant relationships in particular). On a first run that returns ≤1 page, doc-watcher prints a hint pointing at `--includeNew` so you can opt into the slower-but-direct subtree walk explicitly. It never falls back silently.
 
 **Page comments are folded into the `.md`.** Every sync pulls the comments under each root via a single CQL call, threads them, and appends a `## Comments` section to the page they belong to. Inline-anchored comments emit an inline footnote (`[c<n>]`) at their marker position; the Comments section quotes the anchored text so a reader has context. Footer comments follow as a threaded discussion. A page is re-rendered when either its body or its comment set changes.
 
@@ -39,12 +39,11 @@ npm start -- --includeNew  # recursive /child/page walk — slower, but sees new
 
 ## What it doesn't mirror
 
-**Attachments are out of scope.** Inline images, PDFs, diagrams, decks — none of it lands on disk. The page bodies still reference them (image hrefs in the rendered markdown point at the live Confluence `/download/attachments/...` URL), so they display when viewed on a network with access to your Confluence, but nothing gets cached locally. Reasons: attachment downloads dominate bandwidth for any non-trivial space, the on-disk corpus would balloon by orders of magnitude, and the use cases we built doc-watcher for (search, AI tooling, grep) operate on text. If you need a particular attachment, click through to Confluence.
+**Attachments are out of scope.** Inline images, PDFs, diagrams, decks — none of it lands on disk; rendered markdown links back to the live Confluence URL so they only resolve when you're on a network with access.
 
 ## Other verbs
 
 - `npm start -- --reset` — wipe in-memory state so every page is treated as new; re-downloads everything in one pass. Composable with `--includeNew`.
-- `npm start -- reconvert` — regenerate every `.md` from the saved `.html` (no network).
 
 ## Risk profile
 
@@ -55,7 +54,7 @@ This tool runs locally with your Confluence PAT and writes to your filesystem. T
 - **No native modules.** Everything is pure JavaScript. Corporate machines with MITM npm proxies and locked-down compilers can install cleanly. Equally: there's no native code path that could ship a compromised binary.
 - **Config is a TypeScript module you write yourself.** No YAML/JSON/TOML parser, no `.env`, no env-var indirection. Your PAT lives in `config.ts`, gitignored.
 - **TLS verification is disabled process-wide.** Deliberate: corporate Confluence instances often sit behind private CAs and asking every user to wrangle a PEM bundle is worse. The deliberate scope is a single-user CLI talking to a Confluence on a network you already trust. Don't point this at an untrusted host.
-- **Outbound traffic goes to exactly one origin: your Confluence `base_url`.** No telemetry, no analytics, no auto-update check.
+- **Outbound traffic goes to exactly one origin: the Confluence host derived from your `roots`.** Mixed origins are rejected at startup. No telemetry, no analytics, no auto-update check.
 
 Two things to be aware of when auditing:
 

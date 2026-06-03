@@ -51,8 +51,8 @@ export interface DownloadResult {
 }
 
 // Canonical source-URL for a Confluence page. We always use the /pages/viewpage.action
-// form (rather than page._links.webui) so the URL is deterministic — sync and reconvert
-// produce identical .md headers.
+// form (rather than page._links.webui) so the URL is deterministic — every sync
+// produces identical .md headers given identical state.
 export function sourceUrlFor(baseUrl: string, pageId: string): string {
   return `${baseUrl.replace(/\/$/, '')}/pages/viewpage.action?pageId=${pageId}`;
 }
@@ -73,8 +73,7 @@ export function buildWebUiUrl(baseUrl: string, page: ConfluencePage): string {
 
 // Build the body of the .md file. Frontmatter is composed FROM the state
 // entry, not from raw page data — so the index file remains the source of
-// truth and the frontmatter is a regeneratable view. `reconvert` and the
-// online sync both produce identical .md given identical state.
+// truth and the frontmatter is a regeneratable view from the index.
 //
 // The webui_url already replaces the old "<source-url>" autolink at the top
 // of the body, so the header is now just the frontmatter and the H1 title.
@@ -304,8 +303,8 @@ export function pickPageRelPath(
 }
 
 // Shared between fetchAndWriteOne (online sync) and runReconvert (offline rebuild).
-// Both need the same resolver behaviour so a sync and a subsequent reconvert produce
-// byte-identical .md files.
+// Stable resolver behaviour across syncs so re-fetching the same page with
+// the same state always produces byte-identical .md files.
 export function buildConvertOptions(args: {
   pageId: string;
   pagePath: string;
@@ -379,8 +378,8 @@ async function fetchAndWriteOne(
 
   const commentsSection = buildCommentsSection(comments, conversion.inlineCommentAnchors);
 
-  // Write the raw storage-format HTML next to the .md so reconvert can rebuild the
-  // markdown later without re-hitting Confluence.
+  // Write the raw storage-format HTML next to the .md so the markdown can be
+  // re-derived later (e.g. after a converter improvement) without re-fetching.
   const htmlAbsPath = htmlPathFor(absPath);
   const mdBody = buildMarkdownBody(
     {

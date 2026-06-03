@@ -38,7 +38,8 @@ export function spaceIndexPath(spaceKey: string): string {
 
 // Given a markdown path (e.g. "ENG/foo--123.md" or "ENG/foo--123/_index.md"),
 // return the sibling .html path. Used to write raw Confluence storage-format
-// next to every converted .md so reconvert can regenerate without network.
+// next to every converted .md so the markdown can be re-derived from disk
+// (e.g. after a converter improvement) without re-fetching from Confluence.
 export function htmlPathFor(mdPath: string): string {
   return mdPath.replace(/\.md$/, '.html');
 }

@@ -126,11 +126,4 @@ export const messages = {
       `dropping nested section ${childUrl}: it lives under ${parentUrl}, which already covers it`,
   },
 
-  reconvert: {
-    nothing: 'no index files found; nothing to reconvert. Run `npm start` first.',
-    missingHtml: (id: string, htmlPath: string) =>
-      `no .html for page ${id} at ${htmlPath}; skipping (run sync to fetch)`,
-    done: (processed: number, skipped: number) =>
-      `reconvert complete: ${processed} processed, ${skipped} skipped`,
-  },
 };
