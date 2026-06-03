@@ -25,6 +25,8 @@ export default {
   // URL from your browser address bar — any of these shapes work:
   //   /pages/viewpage.action?pageId=12345      (id form, no lookup needed)
   //   /spaces/<KEY>/pages/12345/Title          (newer DC style)
+  //   /spaces/<KEY>/overview                    (newer-UI space homepage)
+  //   /spaces/<KEY>                             (newer-UI space homepage, bare)
   //   /display/<KEY>/Page+Title                (pretty form — one lookup)
   //   /display/<KEY>                            (space homepage)
   //   /spaces/viewspace.action?key=<KEY>        (space homepage, action form)

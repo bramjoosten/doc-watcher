@@ -15,7 +15,7 @@ cp config.example.ts config.ts
 Edit `config.ts`:
 
 - `pat` — Personal Access Token (creation steps are in the file's comment)
-- `roots` — one Confluence URL or a list. Paste whatever URL you have in front of you: id form (`/pages/viewpage.action?pageId=`), pretty form (`/display/<SPACE>/Title`), space homepage (`/display/<SPACE>`), or the newer `/spaces/<SPACE>/pages/<id>/` shape. The Confluence base URL is derived from the origin, so there's no separate `base_url` to keep in sync. All roots must share an origin (one Confluence per run); if you list two roots and one happens to live under the other, the descendant is dropped at startup with a warning.
+- `roots` — one Confluence URL or a list. Paste whatever URL you have in front of you: id form (`/pages/viewpage.action?pageId=`), pretty form (`/display/<SPACE>/Title`), any of the space-homepage forms (`/spaces/<SPACE>/overview`, `/spaces/<SPACE>`, `/display/<SPACE>`, `/spaces/viewspace.action?key=<SPACE>`), or the newer `/spaces/<SPACE>/pages/<id>/` shape. The Confluence base URL is derived from the origin, so there's no separate `base_url` to keep in sync. All roots must share an origin (one Confluence per run); if you list two roots and one happens to live under the other, the descendant is dropped at startup with a warning.
 
 `config.ts` is a TypeScript module — your editor will autocomplete the keys and flag typos thanks to the `satisfies ConfigInput` annotation at the bottom.
 

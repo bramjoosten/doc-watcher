@@ -43,6 +43,15 @@ function classify(url: URL): Classification | null {
     return null;
   }
 
+  // /spaces/<SPACE>/overview or /spaces/<SPACE>(/) — newer-UI space-home form.
+  // Must come after the /spaces/<key>/pages and /spaces/viewspace.action
+  // checks because [^/]+ would otherwise swallow those.
+  const spacesHomeMatch = /^\/spaces\/([^/]+)(?:\/overview)?\/?$/.exec(url.pathname);
+  if (spacesHomeMatch) {
+    const key = decodeURIComponent(spacesHomeMatch[1]!);
+    return { kind: 'space-home', spaceKey: key };
+  }
+
   // /display/<SPACE>/<Title+With+Pluses> — pretty form. No id in URL; resolve by title.
   // /display/<SPACE> on its own is the space homepage.
   const displayMatch = /^\/display\/([^/]+)(?:\/(.+))?$/.exec(url.pathname);
@@ -95,7 +104,7 @@ export async function resolveRoots(
     const classified = classify(url);
     if (!classified) {
       throw new Error(
-        `unrecognised Confluence URL shape: ${href}. Expected /pages/viewpage.action?pageId=, /spaces/<key>/pages/<id>/, /display/<space>/<title>, /display/<space>, or /spaces/viewspace.action?key=<space>`,
+        `unrecognised Confluence URL shape: ${href}. Expected /pages/viewpage.action?pageId=, /spaces/<key>/pages/<id>/, /spaces/<key>/overview, /spaces/<key>, /display/<space>/<title>, /display/<space>, or /spaces/viewspace.action?key=<space>`,
       );
     }
     let pageId: string;
