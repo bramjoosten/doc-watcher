@@ -5,7 +5,7 @@ Download and watch changes on Confluence docs. Confluence Data Center only, not 
 ## Setup
 
 ```sh
-git clone https://code.bramjoosten.nl/bram/doc-watcher.git
+git clone https://github.com/bramjoosten/doc-watcher.git
 cd doc-watcher
 nvm use            # optional — picks up .nvmrc → Node 24. If you don't use nvm, just make sure `node --version` is 24+.
 npm install
