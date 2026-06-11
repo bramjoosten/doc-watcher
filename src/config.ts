@@ -34,6 +34,27 @@ export type ConfigInput = z.input<typeof configSchema>;
 // array. Everything downstream of loadConfig uses this.
 export type Config = z.infer<typeof configSchema>;
 
+// Environment variables that override the corresponding key in config.ts.
+// Env wins over config so a single PAT can be reused across multiple copies
+// of the project without duplicating it into each config.ts. Add new rows
+// here to extend the mechanism.
+const ENV_OVERRIDES: ReadonlyArray<{ env: string; key: keyof ConfigInput }> = [
+  { env: 'DOC_WATCHER_PAT', key: 'pat' },
+];
+
+function applyEnvOverrides(input: unknown): unknown {
+  if (typeof input !== 'object' || input === null) return input;
+  const out = { ...(input as Record<string, unknown>) };
+  for (const { env, key } of ENV_OVERRIDES) {
+    const value = process.env[env];
+    if (value !== undefined && value !== '') {
+      out[key] = value;
+      log.info(messages.config.envOverride(env, key));
+    }
+  }
+  return out;
+}
+
 export interface LoadedConfig {
   config: Config;
   configPath: string;
@@ -72,6 +93,6 @@ export async function loadConfig(
       `${configPath} has no default export. The file should \`export default { ... } satisfies ConfigInput;\` — see config.example.ts.`,
     );
   }
-  const config = configSchema.parse(mod.default);
+  const config = configSchema.parse(applyEnvOverrides(mod.default));
   return { config, configPath, rootDir: process.cwd() };
 }

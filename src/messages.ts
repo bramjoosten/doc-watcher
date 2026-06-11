@@ -119,6 +119,9 @@ export const messages = {
     // Old single-file state from before per-root indexes existed.
     legacyState: (path: string) =>
       `found legacy .state.json at ${path} from before per-section indexes — ignored. Run \`npm start -- --reset\` to rebuild as per-section index files, then delete .state.json.`,
+    // An environment variable was set and overrode the matching config.ts key.
+    envOverride: (envVar: string, key: string) =>
+      `using ${envVar} from environment for \`${key}\` (overrides config.ts)`,
   },
 
   url: {

@@ -14,7 +14,7 @@ cp config.example.ts config.ts
 
 Edit `config.ts`:
 
-- `pat` — Personal Access Token (creation steps are in the file's comment)
+- `pat` — Personal Access Token (creation steps are in the file's comment). Can also be supplied via the `DOC_WATCHER_PAT` environment variable, in which case env wins over the file — useful when you keep multiple checkouts and don't want to duplicate the secret. Doc-watcher logs a one-liner at startup when an env override is in effect.
 - `roots` — one Confluence URL or a list. Paste whatever page or space URL you have in front of you; doc-watcher figures out which Confluence page that points to. The base URL is derived from the origin, so there's no separate `base_url`. All roots must share an origin (one Confluence per run); if you list two roots and one happens to live under the other, the descendant is dropped at startup with a warning.
 
 `config.ts` is a TypeScript module — your editor will autocomplete the keys and flag typos thanks to the `satisfies ConfigInput` annotation at the bottom.
@@ -52,7 +52,7 @@ This tool runs locally with your Confluence PAT and writes to your filesystem. T
 - **No transpiler at runtime.** Node 24 strips TypeScript types natively, so there's no `tsx` / `esbuild` / platform-specific prebuilt binary in the dependency tree. The `.nvmrc` pins to 24.
 - **Three runtime dependencies, all single-package and mainline.** `cheerio` (XHTML parsing — its transitive tree is wide but well-audited), `zod` (config validation), and Node's built-in `fetch` (no separate HTTP library). YAML, env-loaders, CLI frameworks, loggers, test runners — all replaced by stdlib or ~20 lines of in-house code.
 - **No native modules.** Everything is pure JavaScript. Corporate machines with MITM npm proxies and locked-down compilers can install cleanly. Equally: there's no native code path that could ship a compromised binary.
-- **Config is a TypeScript module you write yourself.** No YAML/JSON/TOML parser, no `.env`, no env-var indirection. Your PAT lives in `config.ts`, gitignored.
+- **Config is a TypeScript module you write yourself.** No YAML/JSON/TOML parser, no `.env` loader, no auto-discovered config paths. Your PAT lives in `config.ts` (gitignored), or — opt-in — in a single `DOC_WATCHER_PAT` env var you set yourself, which the loader logs when it takes effect.
 - **TLS verification is disabled process-wide.** Deliberate: corporate Confluence instances often sit behind private CAs and asking every user to wrangle a PEM bundle is worse. The deliberate scope is a single-user CLI talking to a Confluence on a network you already trust. Don't point this at an untrusted host.
 - **Outbound traffic goes to exactly one origin: the Confluence host derived from your `roots`.** Mixed origins are rejected at startup. No telemetry, no analytics, no auto-update check.
 
