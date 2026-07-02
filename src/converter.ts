@@ -363,48 +363,67 @@ function renderList(node: Element, ctx: RenderCtx, ordered: boolean): string {
 }
 
 function renderTable(node: Element, ctx: RenderCtx): string {
+  const rowCells = (tr: Element): Element[] =>
+    (tr.children ?? []).filter(
+      (c): c is Element => isTag(c) && (tagName(c) === 'td' || tagName(c) === 'th'),
+    );
   const collectRow = (tr: Element): string[] =>
-    (tr.children ?? [])
-      .filter((c): c is Element => isTag(c) && (tagName(c) === 'td' || tagName(c) === 'th'))
-      .map((cell) =>
-        renderInline(cell as AnyNode, ctx)
-          .trim()
-          .replace(/\|/g, '\\|')
-          .replace(/\n/g, ' '),
-      );
+    rowCells(tr).map((cell) =>
+      renderInline(cell as AnyNode, ctx)
+        .trim()
+        .replace(/\|/g, '\\|')
+        .replace(/\n/g, ' '),
+    );
+  // A header row is one whose cells are all <th>. Confluence marks its header
+  // this way (inside <tbody>) rather than emitting a <thead>.
+  const isHeaderRow = (tr: Element): boolean => {
+    const cells = rowCells(tr);
+    return cells.length > 0 && cells.every((c) => tagName(c) === 'th');
+  };
 
-  let header: string[] | null = null;
-  const rows: string[][] = [];
+  // Flatten every <tr> in document order, whether it sits directly under
+  // <table> or inside <thead>/<tbody>/<tfoot>. A <thead> row is always the
+  // header; otherwise we promote the first row below if it's a <th> row.
+  let headerRow: Element | null = null;
+  const bodyRows: Element[] = [];
+  const collectSection = (section: Element, fromThead: boolean) => {
+    for (const tr of section.children ?? []) {
+      if (!isTag(tr) || tagName(tr) !== 'tr') continue;
+      if (fromThead && !headerRow) headerRow = tr;
+      else bodyRows.push(tr);
+    }
+  };
   for (const child of node.children ?? []) {
     if (!isTag(child)) continue;
     const name = tagName(child);
-    if (name === 'thead') {
-      for (const tr of child.children ?? []) {
-        if (isTag(tr) && tagName(tr) === 'tr') {
-          header = collectRow(tr);
-          break;
-        }
-      }
-    } else if (name === 'tbody') {
-      for (const tr of child.children ?? []) {
-        if (isTag(tr) && tagName(tr) === 'tr') rows.push(collectRow(tr));
-      }
-    } else if (name === 'tr') {
-      const row = collectRow(child);
-      if (!header) header = row;
-      else rows.push(row);
-    }
+    if (name === 'thead') collectSection(child, true);
+    else if (name === 'tbody' || name === 'tfoot') collectSection(child, false);
+    else if (name === 'tr') bodyRows.push(child);
+  }
+  if (!headerRow && bodyRows.length > 0 && isHeaderRow(bodyRows[0]!)) {
+    headerRow = bodyRows.shift()!;
   }
 
-  if (!header || header.length === 0) return '';
-  const cols = header.length;
+  const header = headerRow ? collectRow(headerRow) : [];
+  const rows = bodyRows.map(collectRow);
+
+  // Width spans the header and every body row so ragged tables still line up.
+  // Computed with a reduce rather than Math.max(...spread) so a table with tens
+  // of thousands of rows can't overflow the call-argument limit and throw.
+  let cols = header.length;
+  for (const r of rows) if (r.length > cols) cols = r.length;
+  if (cols === 0) return '';
+  const pad = (r: string[]): string[] =>
+    r.concat(Array(Math.max(0, cols - r.length)).fill('')).slice(0, cols);
+
+  // GFM requires a header row. Header-less tables (all <td>) get a blank
+  // header so no data row is dropped.
   const lines: string[] = [
-    `| ${header.join(' | ')} |`,
+    `| ${pad(header).join(' | ')} |`,
     `| ${Array(cols).fill('---').join(' | ')} |`,
   ];
   for (const row of rows) {
-    const padded = row.concat(Array(Math.max(0, cols - row.length)).fill(''));
-    lines.push(`| ${padded.slice(0, cols).join(' | ')} |`);
+    lines.push(`| ${pad(row).join(' | ')} |`);
   }
   return `${lines.join('\n')}\n\n`;
 }
